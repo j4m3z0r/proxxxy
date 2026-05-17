@@ -11,15 +11,22 @@ import (
 )
 
 func main() {
-	display := flag.Int("display", 2, "X display number to present (e.g. 2 → DISPLAY=:2)")
-	port := flag.Int("port", 7100, "TCP port for proxxxy-client")
+	display   := flag.Int("display", 2, "X display number to present (e.g. 2 → DISPLAY=:2)")
+	port      := flag.Int("port", 7100, "TCP port for proxxxy-client")
+	statsPort := flag.Int("stats-port", 0, "HTTP stats port (0 = port+1)")
 	flag.Parse()
 
-	s := server.New(*display, *port, 7101)
+	sp := *statsPort
+	if sp == 0 {
+		sp = *port + 1
+	}
+
+	s := server.New(*display, *port, sp)
 	if err := s.Start(); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("DISPLAY=:%d  client port=%d", *display, *port)
+	log.Printf("DISPLAY=:%d  client-port=%d  stats=http://localhost:%d/stats",
+		*display, *port, sp)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

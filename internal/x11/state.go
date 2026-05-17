@@ -31,11 +31,12 @@ type GC struct {
 
 // Pixmap represents a tracked X11 pixmap plus its drawing history.
 type Pixmap struct {
-	ID       uint32
-	Width    uint16
-	Height   uint16
-	Depth    byte
-	DrawCmds [][]byte
+	ID        uint32
+	Width     uint16
+	Height    uint16
+	Depth     byte
+	DrawCmds  [][]byte
+	createReq []byte
 }
 
 // Font represents an open X11 font.
@@ -201,11 +202,14 @@ func (a *AppConn) handleCreatePixmap(req []byte) {
 	if len(req) < 16 {
 		return
 	}
+	cp := make([]byte, len(req))
+	copy(cp, req)
 	a.pixmaps[U32(req, 4, a.Order)] = &Pixmap{
-		ID:     U32(req, 4, a.Order),
-		Depth:  req[1],
-		Width:  U16(req, 12, a.Order),
-		Height: U16(req, 14, a.Order),
+		ID:        U32(req, 4, a.Order),
+		Depth:     req[1],
+		Width:     U16(req, 12, a.Order),
+		Height:    U16(req, 14, a.Order),
+		createReq: cp,
 	}
 }
 
@@ -281,6 +285,37 @@ func (a *AppConn) Windows() map[uint32]*Window {
 	}
 	return out
 }
+
+// GCs returns a snapshot of all tracked graphics contexts.
+func (a *AppConn) GCs() map[uint32]*GC {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32]*GC, len(a.gcs))
+	for k, v := range a.gcs {
+		out[k] = v
+	}
+	return out
+}
+
+// Pixmaps returns a snapshot of all tracked pixmaps.
+func (a *AppConn) Pixmaps() map[uint32]*Pixmap {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32]*Pixmap, len(a.pixmaps))
+	for k, v := range a.pixmaps {
+		out[k] = v
+	}
+	return out
+}
+
+// CreateReq returns the raw X11 CreateWindow request bytes.
+func (w *Window) CreateReq() []byte { return w.createReq }
+
+// CreateReq returns the raw X11 CreateGC request bytes.
+func (g *GC) CreateReq() []byte { return g.createReq }
+
+// CreateReq returns the raw X11 CreatePixmap request bytes.
+func (p *Pixmap) CreateReq() []byte { return p.createReq }
 
 func removeID(s []uint32, id uint32) []uint32 {
 	out := s[:0]

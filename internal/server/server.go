@@ -185,9 +185,8 @@ func (s *Server) handleClient(conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	// Phase 1: no state to replay.
-	wire.Write(conn, wire.MsgSessionResume, nil)
-	wire.Write(conn, wire.MsgSessionLive, nil)
+	// Phase 2: synthesise existing X11 state for the reconnecting client.
+	s.runSynthesis()
 
 	log.Println("server: client connected")
 	s.readFromClient(conn)

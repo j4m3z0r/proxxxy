@@ -1,0 +1,8 @@
+# binaries
+/proxxxy-server
+/proxxxy-client
+/proxxxy-ctl
+/testclient
+
+# build output
+*.test

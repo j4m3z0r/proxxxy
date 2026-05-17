@@ -1,12 +1,14 @@
 package client
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"sync"
 
+	"james.id.au/proxxxy/internal/compress"
 	"james.id.au/proxxxy/internal/wire"
 )
 
@@ -17,14 +19,16 @@ type Client struct {
 	server net.Conn
 	srvW   sync.Mutex // serialises writes to server
 
-	mu     sync.Mutex
-	xConns map[uint32]net.Conn
+	mu       sync.Mutex
+	xConns   map[uint32]net.Conn
+	decoders map[uint32]*compress.Decoder
 }
 
 func New(serverAddr string) *Client {
 	return &Client{
 		serverAddr: serverAddr,
 		xConns:     make(map[uint32]net.Conn),
+		decoders:   make(map[uint32]*compress.Decoder),
 	}
 }
 
@@ -64,8 +68,11 @@ func (c *Client) Run() error {
 		if msg.Type == wire.MsgSessionLive {
 			break
 		}
-		if msg.Type == wire.MsgX11Data {
+		switch msg.Type {
+		case wire.MsgX11Data:
 			c.handleX11Data(msg.Payload)
+		case wire.MsgDictDefine, wire.MsgDictRef, wire.MsgDictExpire, wire.MsgTemplateDefine, wire.MsgTemplateApply:
+			c.handleCompressed(msg)
 		}
 	}
 
@@ -76,8 +83,11 @@ func (c *Client) Run() error {
 		if err != nil {
 			return fmt.Errorf("server gone: %w", err)
 		}
-		if msg.Type == wire.MsgX11Data {
+		switch msg.Type {
+		case wire.MsgX11Data:
 			c.handleX11Data(msg.Payload)
+		case wire.MsgDictDefine, wire.MsgDictRef, wire.MsgDictExpire, wire.MsgTemplateDefine, wire.MsgTemplateApply:
+			c.handleCompressed(msg)
 		}
 	}
 }
@@ -105,6 +115,42 @@ func (c *Client) handleX11Data(payload []byte) {
 		go c.relayXToServer(connID, xconn)
 	}
 
+	if _, err := xconn.Write(data); err != nil {
+		log.Println("client: write to display:", err)
+	}
+}
+
+func (c *Client) handleCompressed(msg wire.Msg) {
+	if len(msg.Payload) < 4 {
+		log.Println("client: compressed msg payload too short")
+		return
+	}
+	connID := binary.LittleEndian.Uint32(msg.Payload[:4])
+
+	c.mu.Lock()
+	dec, ok := c.decoders[connID]
+	if !ok {
+		dec = compress.NewDecoder()
+		c.decoders[connID] = dec
+	}
+	c.mu.Unlock()
+
+	_, data, err := dec.Decode(msg)
+	if err != nil {
+		log.Println("client: decode:", err)
+		return
+	}
+	if data == nil {
+		return // define/expire — nothing to forward
+	}
+
+	c.mu.Lock()
+	xconn := c.xConns[connID]
+	c.mu.Unlock()
+	if xconn == nil {
+		log.Printf("client: compressed msg for unknown connID %d", connID)
+		return
+	}
 	if _, err := xconn.Write(data); err != nil {
 		log.Println("client: write to display:", err)
 	}

@@ -31,6 +31,9 @@ type Msg struct {
 
 // Write sends one message to w. payload may be nil for empty messages.
 func Write(w io.Writer, msgType byte, payload []byte) error {
+	if uint32(len(payload)) > maxMessageSize {
+		return fmt.Errorf("wire: payload too large: %d bytes", len(payload))
+	}
 	hdr := [5]byte{msgType}
 	binary.LittleEndian.PutUint32(hdr[1:], uint32(len(payload)))
 	if _, err := w.Write(hdr[:]); err != nil {

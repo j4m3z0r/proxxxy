@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"james.id.au/proxxxy/internal/wire"
+	"james.id.au/proxxxy/internal/x11"
 )
 
 // Server presents a fake X display and relays to a connected proxxxy-client.
@@ -25,6 +27,7 @@ type Server struct {
 	clientW    sync.Mutex // serialises writes to clientConn
 	nextID     atomic.Uint32
 	appConns   map[uint32]net.Conn
+	appState   map[uint32]*x11.AppConn
 }
 
 func New(displayNum, tcpPort int) *Server {
@@ -32,6 +35,7 @@ func New(displayNum, tcpPort int) *Server {
 		displayNum: displayNum,
 		tcpPort:    tcpPort,
 		appConns:   make(map[uint32]net.Conn),
+		appState:   make(map[uint32]*x11.AppConn),
 	}
 }
 
@@ -102,16 +106,30 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 		delete(s.appConns, connID)
 		s.mu.Unlock()
 	}()
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := app.Read(buf)
-		if n > 0 {
-			s.sendToClient(connID, buf[:n])
-		}
-		if err != nil {
-			return
-		}
+
+	// Read connection setup, capture bytes, then forward synchronously.
+	var setupBuf bytes.Buffer
+	order, _, err := parseConnSetup(app, &setupBuf)
+	if err != nil {
+		return
 	}
+	if setupBuf.Len() > 0 {
+		s.sendToClient(connID, setupBuf.Bytes())
+	}
+
+	ac := x11.NewAppConn(connID, order)
+	s.mu.Lock()
+	s.appState[connID] = ac
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.appState, connID)
+		s.mu.Unlock()
+	}()
+
+	drainRequests(app, ac, func(b []byte) {
+		s.sendToClient(connID, b)
+	})
 }
 
 func (s *Server) sendToClient(connID uint32, data []byte) {

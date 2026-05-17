@@ -26,6 +26,22 @@ func TestE2ERelay(t *testing.T) {
 	defer os.Remove(stubSocket)
 	defer stubL.Close()
 
+	// Valid minimal X11 connection setup (12 bytes, little-endian, no auth).
+	setup := []byte{
+		0x6c, 0x00, // byte order LE, pad
+		0x0b, 0x00, // protocol major 11
+		0x00, 0x00, // protocol minor 0
+		0x00, 0x00, // auth-proto-name len 0
+		0x00, 0x00, // auth-proto-data len 0
+		0x00, 0x00, // pad
+	}
+	// Valid minimal X11 request: opcode=1 (CreateWindow placeholder), extra=0,
+	// length=1 (meaning 4 bytes total). We use opcode=55 (CreateGC has 4-word
+	// minimum but for drainRequests we only need length≥1). Use a NoOperation
+	// request: opcode=127, extra=0, length=1 → 4 bytes.
+	noop := []byte{127, 0, 1, 0} // NoOperation request, 4 bytes
+	want := append(setup, noop...)
+
 	received := make(chan []byte, 1)
 	go func() {
 		conn, err := stubL.Accept()
@@ -35,7 +51,6 @@ func TestE2ERelay(t *testing.T) {
 		defer conn.Close()
 		buf := make([]byte, 1024)
 		// Fix #4: use io.ReadFull to avoid partial reads.
-		want := []byte("hello X server")
 		if _, err := io.ReadFull(conn, buf[:len(want)]); err != nil {
 			return
 		}
@@ -79,24 +94,29 @@ func TestE2ERelay(t *testing.T) {
 	}
 	defer appConn.Close()
 
-	// App sends some bytes.
-	want := []byte("hello X server")
+	// App sends a valid X11 connection setup followed by a NoOperation request.
 	// Fix #5: check write error.
 	if _, err := appConn.Write(want); err != nil {
 		t.Fatal("write to app:", err)
 	}
 
-	// The client stub (which would forward to :98) should receive them as X11_DATA.
+	// The client stub should receive the setup bytes as X11_DATA (from parseConnSetup),
+	// then the noop request bytes as another X11_DATA (from drainRequests).
+	// We accumulate all X11_DATA payloads until we have len(want) bytes.
 	clientConn.SetDeadline(time.Now().Add(2 * time.Second))
-	msg, err = wire.Read(clientConn)
-	if err != nil {
-		t.Fatal("read X11_DATA:", err)
+	var got []byte
+	for len(got) < len(want) {
+		msg, err = wire.Read(clientConn)
+		if err != nil {
+			t.Fatalf("read X11_DATA (got %d/%d bytes so far): %v", len(got), len(want), err)
+		}
+		if msg.Type != wire.MsgX11Data {
+			t.Fatalf("expected X11_DATA got %x", msg.Type)
+		}
+		_, data, _ := wire.ParseX11Data(msg.Payload)
+		got = append(got, data...)
 	}
-	if msg.Type != wire.MsgX11Data {
-		t.Fatalf("expected X11_DATA got %x", msg.Type)
-	}
-	_, data, _ := wire.ParseX11Data(msg.Payload)
-	if !bytes.Equal(data, want) {
-		t.Fatalf("data: got %q want %q", data, want)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("data: got %q want %q", got, want)
 	}
 }

@@ -145,12 +145,22 @@ func (c *Client) handleCompressed(msg wire.Msg) {
 	}
 
 	c.mu.Lock()
-	xconn := c.xConns[connID]
+	xconn, ok := c.xConns[connID]
 	c.mu.Unlock()
-	if xconn == nil {
-		log.Printf("client: compressed msg for unknown connID %d", connID)
-		return
+
+	if !ok {
+		var err error
+		xconn, err = dialX11(localDisplay())
+		if err != nil {
+			log.Println("client: dial local display:", err)
+			return
+		}
+		c.mu.Lock()
+		c.xConns[connID] = xconn
+		c.mu.Unlock()
+		go c.relayXToServer(connID, xconn)
 	}
+
 	if _, err := xconn.Write(data); err != nil {
 		log.Println("client: write to display:", err)
 	}
@@ -161,6 +171,7 @@ func (c *Client) relayXToServer(connID uint32, xconn net.Conn) {
 		xconn.Close()
 		c.mu.Lock()
 		delete(c.xConns, connID)
+		delete(c.decoders, connID)
 		c.mu.Unlock()
 	}()
 	buf := make([]byte, 32*1024)

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"james.id.au/proxxxy/internal/compress"
 	"james.id.au/proxxxy/internal/wire"
 	"james.id.au/proxxxy/internal/x11"
 )
@@ -118,6 +119,7 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 	}
 
 	ac := x11.NewAppConn(connID, order)
+	enc := compress.NewEncoder(connID, 4*1024*1024) // 4 MB dict per connection
 	s.mu.Lock()
 	s.appState[connID] = ac
 	s.mu.Unlock()
@@ -125,10 +127,19 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 		s.mu.Lock()
 		delete(s.appState, connID)
 		s.mu.Unlock()
+		enc.OnClientDisconnect()
 	}()
 
-	drainRequests(app, ac, func(b []byte) {
-		s.sendToClient(connID, b)
+	drainRequests(app, ac, enc, func(msg wire.Msg) {
+		s.mu.Lock()
+		c := s.clientConn
+		s.mu.Unlock()
+		if c == nil {
+			return
+		}
+		s.clientW.Lock()
+		wire.Write(c, msg.Type, msg.Payload)
+		s.clientW.Unlock()
 	})
 }
 

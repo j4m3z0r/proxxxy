@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 
+	"james.id.au/proxxxy/internal/compress"
+	"james.id.au/proxxxy/internal/wire"
 	"james.id.au/proxxxy/internal/x11"
 )
 
@@ -38,9 +40,10 @@ func parseConnSetup(conn net.Conn, out io.Writer) (binary.ByteOrder, []byte, err
 	return order, full, nil
 }
 
-// drainRequests reads X11 requests from app, updates appConn state, and
-// forwards raw bytes to sendFn. Runs until the connection is closed.
-func drainRequests(app net.Conn, ac *x11.AppConn, sendFn func([]byte)) {
+// drainRequests reads X11 requests from app, updates appConn state, encodes them
+// via enc, and forwards the resulting messages via sendMsgFn. Runs until the
+// connection is closed.
+func drainRequests(app net.Conn, ac *x11.AppConn, enc *compress.Encoder, sendMsgFn func(wire.Msg)) {
 	r := bufio.NewReaderSize(app, 32*1024)
 	hdr := make([]byte, 4)
 	for {
@@ -60,6 +63,14 @@ func drainRequests(app net.Conn, ac *x11.AppConn, sendFn func([]byte)) {
 		copy(full, hdr)
 		copy(full[4:], body)
 		ac.ProcessRequest(full)
-		sendFn(full)
+
+		// Drain any DICT_EXPIRE messages.
+		for _, msg := range enc.DrainExpiredDicts() {
+			sendMsgFn(msg)
+		}
+		// Encode and send compressed messages.
+		for _, msg := range enc.Encode(0, full, ac.Order) {
+			sendMsgFn(msg)
+		}
 	}
 }

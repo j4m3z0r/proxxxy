@@ -101,22 +101,37 @@ func TestE2ERelay(t *testing.T) {
 	}
 
 	// The client stub should receive the setup bytes as X11_DATA (from parseConnSetup),
-	// then the noop request bytes as another X11_DATA (from drainRequests).
-	// We accumulate all X11_DATA payloads until we have len(want) bytes.
+	// then at least one encoder message for the noop request (MsgDictDefine, MsgDictRef,
+	// or MsgX11Data — depending on the encoder's classification).
 	clientConn.SetDeadline(time.Now().Add(2 * time.Second))
-	var got []byte
-	for len(got) < len(want) {
+
+	// First, collect setup bytes from X11_DATA messages.
+	var gotSetup []byte
+	for len(gotSetup) < len(setup) {
 		msg, err = wire.Read(clientConn)
 		if err != nil {
-			t.Fatalf("read X11_DATA (got %d/%d bytes so far): %v", len(got), len(want), err)
+			t.Fatalf("read setup X11_DATA (got %d/%d bytes so far): %v", len(gotSetup), len(setup), err)
 		}
 		if msg.Type != wire.MsgX11Data {
-			t.Fatalf("expected X11_DATA got %x", msg.Type)
+			t.Fatalf("expected X11_DATA for setup, got %x", msg.Type)
 		}
 		_, data, _ := wire.ParseX11Data(msg.Payload)
-		got = append(got, data...)
+		gotSetup = append(gotSetup, data...)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("data: got %q want %q", got, want)
+	if !bytes.Equal(gotSetup, setup) {
+		t.Fatalf("setup data: got %q want %q", gotSetup, setup)
+	}
+
+	// The noop request is now processed by the encoder, which may produce
+	// MsgDictDefine, MsgDictRef, or MsgX11Data. Accept any of these.
+	msg, err = wire.Read(clientConn)
+	if err != nil {
+		t.Fatalf("read noop message: %v", err)
+	}
+	switch msg.Type {
+	case wire.MsgX11Data, wire.MsgDictDefine, wire.MsgDictRef, wire.MsgTemplateDefine, wire.MsgTemplateApply:
+		// expected: the encoder emitted a valid compressed or raw message
+	default:
+		t.Fatalf("unexpected message type for noop: %x", msg.Type)
 	}
 }

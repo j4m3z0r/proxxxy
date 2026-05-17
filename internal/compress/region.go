@@ -1,6 +1,9 @@
 package compress
 
-import "sync"
+import (
+	"encoding/binary"
+	"sync"
+)
 
 // Rect is a 2D rectangle.
 type Rect struct{ X, Y, W, H int }
@@ -33,8 +36,8 @@ func NewRegionTracker() *RegionTracker {
 // Add records a draw command for the given window.
 // It extracts a bounding rect from the command and removes any earlier
 // commands fully covered by this one.
-func (rt *RegionTracker) Add(windowID uint32, cmd []byte) {
-	r := extractRect(cmd)
+func (rt *RegionTracker) Add(windowID uint32, cmd []byte, order binary.ByteOrder) {
+	r := extractRect(cmd, order)
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
@@ -83,7 +86,7 @@ func (rt *RegionTracker) Flush(windowID uint32) [][]byte {
 
 // extractRect attempts to extract a bounding rectangle from an X11 draw command.
 // Returns a zero Rect if the command does not carry explicit coordinates.
-func extractRect(cmd []byte) Rect {
+func extractRect(cmd []byte, order binary.ByteOrder) Rect {
 	if len(cmd) < 16 {
 		return Rect{}
 	}
@@ -91,20 +94,20 @@ func extractRect(cmd []byte) Rect {
 	switch opcode {
 	case 61: // ClearArea: [op][exp][len:2][win:4][x:2][y:2][w:2][h:2]
 		return Rect{
-			X: int(int16(uint16(cmd[8]) | uint16(cmd[9])<<8)),
-			Y: int(int16(uint16(cmd[10]) | uint16(cmd[11])<<8)),
-			W: int(uint16(cmd[12]) | uint16(cmd[13])<<8),
-			H: int(uint16(cmd[14]) | uint16(cmd[15])<<8),
+			X: int(int16(order.Uint16(cmd[8:10]))),
+			Y: int(int16(order.Uint16(cmd[10:12]))),
+			W: int(order.Uint16(cmd[12:14])),
+			H: int(order.Uint16(cmd[14:16])),
 		}
 	case 70: // PolyFillRectangle: [op][0][len:2][draw:4][gc:4][x:2][y:2][w:2][h:2]
 		if len(cmd) < 20 {
 			return Rect{}
 		}
 		return Rect{
-			X: int(int16(uint16(cmd[12]) | uint16(cmd[13])<<8)),
-			Y: int(int16(uint16(cmd[14]) | uint16(cmd[15])<<8)),
-			W: int(uint16(cmd[16]) | uint16(cmd[17])<<8),
-			H: int(uint16(cmd[18]) | uint16(cmd[19])<<8),
+			X: int(int16(order.Uint16(cmd[12:14]))),
+			Y: int(int16(order.Uint16(cmd[14:16]))),
+			W: int(order.Uint16(cmd[16:18])),
+			H: int(order.Uint16(cmd[18:20])),
 		}
 	}
 	return Rect{}

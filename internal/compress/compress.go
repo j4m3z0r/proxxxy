@@ -33,14 +33,14 @@ func (e *Encoder) OnClientDisconnect() {
 
 // Encode processes one X11 command and returns a sequence of wire messages to
 // send to the proxxxy-client. windowID is the target window (0 if not a draw cmd).
-func (e *Encoder) Encode(windowID uint32, cmd []byte) []wire.Msg {
+func (e *Encoder) Encode(windowID uint32, cmd []byte, order binary.ByteOrder) []wire.Msg {
 	if len(cmd) == 0 {
 		return nil
 	}
 
 	// Level 5: region coalescing — queue and flush.
 	if windowID != 0 {
-		e.regions.Add(windowID, cmd)
+		e.regions.Add(windowID, cmd, order)
 		cmds := e.regions.Flush(windowID)
 		var out []wire.Msg
 		for _, c := range cmds {

@@ -1,7 +1,6 @@
 package x11
 
 import (
-	"encoding/binary"
 	"sync"
 )
 
@@ -331,10 +330,3 @@ func removeID(s []uint32, id uint32) []uint32 {
 	return out
 }
 
-// byteOrderFromByte returns the byte order for the X11 connection setup byte.
-func byteOrderFromByte(b byte) ByteOrder {
-	if b == 0x42 {
-		return binary.BigEndian
-	}
-	return binary.LittleEndian
-}

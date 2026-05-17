@@ -1,6 +1,7 @@
 package compress_test
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"james.id.au/proxxxy/internal/compress"
@@ -28,8 +29,8 @@ func TestRegionCoalesceClearThenFill(t *testing.T) {
 		200, 0, 200, 0,
 	}
 
-	tracker.Add(0x00100001, clear)
-	tracker.Add(0x00100001, fill)
+	tracker.Add(0x00100001, clear, binary.LittleEndian)
+	tracker.Add(0x00100001, fill, binary.LittleEndian)
 
 	coalesced := tracker.Flush(0x00100001)
 	if len(coalesced) != 1 {
@@ -44,7 +45,7 @@ func TestRegionAck(t *testing.T) {
 	tracker := compress.NewRegionTracker()
 	fill := []byte{70, 0, 4, 0, 0x01, 0x00, 0x10, 0x00, 0x01, 0x00, 0x20, 0x00,
 		50, 0, 50, 0, 200, 0, 200, 0}
-	tracker.Add(0x00100001, fill)
+	tracker.Add(0x00100001, fill, binary.LittleEndian)
 
 	// Ack the region — pending commands should be cleared.
 	tracker.Ack(0x00100001, 50, 50, 200, 200)

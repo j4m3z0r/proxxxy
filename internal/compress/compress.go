@@ -9,14 +9,16 @@ import (
 // Encoder wraps Dict + TemplateRegistry + RegionTracker and applies all three
 // compression levels to outgoing X11 command sequences.
 type Encoder struct {
+	connID    uint32
 	dict      *Dict
 	templates *TemplateRegistry
 	regions   *RegionTracker
 	prev      map[byte][]byte // last command seen per opcode, for template detection
 }
 
-func NewEncoder(dictCapacity int) *Encoder {
+func NewEncoder(connID uint32, dictCapacity int) *Encoder {
 	return &Encoder{
+		connID:    connID,
 		dict:      NewDict(dictCapacity),
 		templates: NewTemplateRegistry(),
 		regions:   NewRegionTracker(),
@@ -88,8 +90,11 @@ func (e *Encoder) encodeOne(cmd []byte) []wire.Msg {
 	case ActionRef:
 		return []wire.Msg{makeDictRef(id)}
 	}
-	// ActionPassthrough — sequence too large for dict. Caller must wrap in X11_DATA.
-	return []wire.Msg{{Type: wire.MsgX11Data, Payload: append([]byte{0, 0, 0, 0}, cmd...)}}
+	// ActionPassthrough — sequence too large for dict.
+	p := make([]byte, 4+len(cmd))
+	binary.LittleEndian.PutUint32(p[:4], e.connID)
+	copy(p[4:], cmd)
+	return []wire.Msg{{Type: wire.MsgX11Data, Payload: p}}
 }
 
 func makeDictDefine(id uint64, data []byte) wire.Msg {

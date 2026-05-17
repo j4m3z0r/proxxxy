@@ -38,8 +38,11 @@ func (c *Client) Run() error {
 
 	// Server sends HELLO first.
 	msg, err := wire.Read(conn)
-	if err != nil || msg.Type != wire.MsgHello {
+	if err != nil {
 		return fmt.Errorf("read server HELLO: %w", err)
+	}
+	if msg.Type != wire.MsgHello {
+		return fmt.Errorf("read server HELLO: unexpected message type 0x%02x", msg.Type)
 	}
 	version, err := wire.ReadHello(msg.Payload)
 	if err != nil {

@@ -51,7 +51,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen unix: %w", err)
 	}
-	if err := os.Chmod(socketPath, 0o777); err != nil {
+	if err = os.Chmod(socketPath, 0o777); err != nil {
 		unixL.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}

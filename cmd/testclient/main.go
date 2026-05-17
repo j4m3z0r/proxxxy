@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -51,10 +50,18 @@ func main() {
 	}
 
 	// WM_DELETE_WINDOW
-	wmProto, _ := xproto.InternAtom(X, true, uint16(len("WM_PROTOCOLS")), "WM_PROTOCOLS").Reply()
-	wmDel, _ := xproto.InternAtom(X, true, uint16(len("WM_DELETE_WINDOW")), "WM_DELETE_WINDOW").Reply()
+	wmProto, err := xproto.InternAtom(X, true, uint16(len("WM_PROTOCOLS")), "WM_PROTOCOLS").Reply()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "intern WM_PROTOCOLS:", err)
+		os.Exit(1)
+	}
+	wmDel, err := xproto.InternAtom(X, true, uint16(len("WM_DELETE_WINDOW")), "WM_DELETE_WINDOW").Reply()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "intern WM_DELETE_WINDOW:", err)
+		os.Exit(1)
+	}
 	delBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(delBytes, uint32(wmDel.Atom))
+	xgb.Put32(delBytes, uint32(wmDel.Atom))
 	xproto.ChangeProperty(X, xproto.PropModeReplace, wid,
 		wmProto.Atom, xproto.AtomAtom, 32, 1, delBytes)
 

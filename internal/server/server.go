@@ -29,6 +29,7 @@ type Server struct {
 	nextID     atomic.Uint32
 	appConns   map[uint32]net.Conn
 	appState   map[uint32]*x11.AppConn
+	encoders   sync.Map // uint32 connID → *compress.Encoder
 }
 
 func New(displayNum, tcpPort int) *Server {
@@ -123,7 +124,10 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 	s.mu.Lock()
 	s.appState[connID] = ac
 	s.mu.Unlock()
+
+	s.encoders.Store(connID, enc)
 	defer func() {
+		s.encoders.Delete(connID)
 		s.mu.Lock()
 		delete(s.appState, connID)
 		s.mu.Unlock()
@@ -131,7 +135,9 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 	}()
 
 	drainRequests(app, ac, enc, func(data []byte) {
+		enc.Stats.BytesIn.Add(int64(len(data)))
 		s.sendToClient(connID, data)
+		enc.Stats.BytesOut.Add(int64(len(data)))
 	})
 }
 

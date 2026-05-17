@@ -3,30 +3,38 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
+	"io"
 	"log"
-	"net"
+	"net/http"
 	"os"
 )
 
 func main() {
-	server := flag.String("server", "localhost:7101", "proxxxy-server stats address")
+	server    := flag.String("server",    "http://localhost:7101", "proxxxy stats server base URL")
+	aggregate := flag.Bool("aggregate",   false,                   "show aggregate stats only")
 	flag.Parse()
 
-	conn, err := net.Dial("tcp", *server)
+	url := *server + "/stats"
+	if *aggregate {
+		url += "?aggregate=1"
+	}
+
+	resp, err := http.Get(url) //nolint:noctx
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer resp.Body.Close()
 
-	var stats map[string]interface{}
-	if err := json.NewDecoder(conn).Decode(&stats); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var v any
+	if err := json.Unmarshal(body, &v); err != nil {
 		log.Fatal(err)
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(stats); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println()
+	enc.Encode(v)
 }

@@ -68,7 +68,7 @@ func (tr *TemplateRegistry) Observe(seq1, seq2 []byte) (*Template, [][]byte, boo
 
 	opcode := seq1[0]
 	for _, tmpl := range tr.byOpcode[opcode] {
-		if slotsMatch(tmpl.slots, slots) {
+		if slotsMatch(tmpl.slots, slots) && baseMatches(tmpl.base, seq2, slots) {
 			p := extractParams(seq2, slots)
 			return tmpl, p, false
 		}
@@ -118,6 +118,25 @@ func slotsMatch(a, b []ParamSlot) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// baseMatches checks that seq's non-slot bytes are identical to base's non-slot
+// bytes. This ensures a template is only reused when the fixed parts of the
+// command match the template — prevents Apply from reconstructing the wrong bytes
+// when the "constant" fields changed between calls (e.g. different GC id).
+func baseMatches(base, seq []byte, slots []ParamSlot) bool {
+	slotIdx := 0
+	for i := 0; i < len(base); i++ {
+		if slotIdx < len(slots) && i == slots[slotIdx].Offset {
+			i += slots[slotIdx].Length - 1
+			slotIdx++
+			continue
+		}
+		if base[i] != seq[i] {
 			return false
 		}
 	}

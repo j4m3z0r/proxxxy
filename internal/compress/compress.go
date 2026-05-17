@@ -14,6 +14,7 @@ type Encoder struct {
 	templates *TemplateRegistry
 	regions   *RegionTracker
 	prev      map[byte][]byte // last command seen per opcode, for template detection
+	Stats     *Stats
 }
 
 func NewEncoder(connID uint32, dictCapacity int) *Encoder {
@@ -23,6 +24,7 @@ func NewEncoder(connID uint32, dictCapacity int) *Encoder {
 		templates: NewTemplateRegistry(),
 		regions:   NewRegionTracker(),
 		prev:      make(map[byte][]byte),
+		Stats:     &Stats{},
 	}
 }
 
@@ -72,11 +74,13 @@ func (e *Encoder) encodeOne(cmd []byte) []wire.Msg {
 		if tmpl != nil {
 			e.prev[opcode] = cmd
 			if isNew {
+				e.Stats.TemplateDefs.Add(1)
 				return []wire.Msg{
 					makeTemplateDefine(tmpl),
 					makeTemplateApply(tmpl.ID, params),
 				}
 			}
+			e.Stats.TemplateHits.Add(1)
 			return []wire.Msg{makeTemplateApply(tmpl.ID, params)}
 		}
 	}
@@ -86,11 +90,14 @@ func (e *Encoder) encodeOne(cmd []byte) []wire.Msg {
 	action, id, data := e.dict.Classify(cmd)
 	switch action {
 	case ActionDefine:
+		e.Stats.DictDefines.Add(1)
 		return []wire.Msg{makeDictDefine(id, data)}
 	case ActionRef:
+		e.Stats.DictHits.Add(1)
 		return []wire.Msg{makeDictRef(id)}
 	}
 	// ActionPassthrough — sequence too large for dict.
+	e.Stats.DictPasses.Add(1)
 	p := make([]byte, 4+len(cmd))
 	binary.LittleEndian.PutUint32(p[:4], e.connID)
 	copy(p[4:], cmd)

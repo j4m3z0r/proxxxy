@@ -59,7 +59,7 @@ func TestE2ERelay(t *testing.T) {
 	}()
 
 	// Start proxxxy-server on display :97, TCP port 17197.
-	s := server.New(97, 17197)
+	s := server.New(97, 17197, 17297)
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}

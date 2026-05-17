@@ -11,7 +11,7 @@ import (
 )
 
 func TestHandshakeVersionMismatch(t *testing.T) {
-	s := server.New(99, 17199)
+	s := server.New(99, 17199, 17299)
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestHandshakeVersionMismatch(t *testing.T) {
 }
 
 func TestHandshakeSuccess(t *testing.T) {
-	s := server.New(99, 17200)
+	s := server.New(99, 17200, 17300)
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,7 @@ func main() {
 	port := flag.Int("port", 7100, "TCP port for proxxxy-client")
 	flag.Parse()
 
-	s := server.New(*display, *port)
+	s := server.New(*display, *port, 7101)
 	if err := s.Start(); err != nil {
 		log.Fatal(err)
 	}

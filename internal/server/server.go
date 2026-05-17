@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -19,9 +20,11 @@ import (
 type Server struct {
 	displayNum int
 	tcpPort    int
+	statsPort  int
 
-	unixL net.Listener
-	tcpL  net.Listener
+	unixL     net.Listener
+	tcpL      net.Listener
+	statsHTTP *http.Server
 
 	mu         sync.Mutex
 	clientConn net.Conn   // current proxxxy-client (nil = none connected)
@@ -32,10 +35,11 @@ type Server struct {
 	encoders   sync.Map // uint32 connID → *compress.Encoder
 }
 
-func New(displayNum, tcpPort int) *Server {
+func New(displayNum, tcpPort, statsPort int) *Server {
 	return &Server{
 		displayNum: displayNum,
 		tcpPort:    tcpPort,
+		statsPort:  statsPort,
 		appConns:   make(map[uint32]net.Conn),
 		appState:   make(map[uint32]*x11.AppConn),
 	}
@@ -73,10 +77,14 @@ func (s *Server) Start() error {
 
 	go s.acceptX11(unixL)
 	go s.acceptClients(tcpL)
+	s.startStatsHTTP()
 	return nil
 }
 
 func (s *Server) Stop() {
+	if s.statsHTTP != nil {
+		s.statsHTTP.Close()
+	}
 	if s.unixL != nil {
 		s.unixL.Close()
 	}
@@ -85,6 +93,20 @@ func (s *Server) Stop() {
 	}
 	os.Remove(fmt.Sprintf("/tmp/.X11-unix/X%d", s.displayNum))
 	os.Remove(fmt.Sprintf("/tmp/.X%d-lock", s.displayNum))
+}
+
+func (s *Server) startStatsHTTP() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stats", s.handleStats)
+	s.statsHTTP = &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", s.statsPort),
+		Handler: mux,
+	}
+	go func() {
+		if err := s.statsHTTP.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Println("server: stats HTTP:", err)
+		}
+	}()
 }
 
 func (s *Server) acceptX11(l net.Listener) {

@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -21,8 +22,9 @@ func TestE2ERelay(t *testing.T) {
 	if err != nil {
 		t.Fatal("stub listen:", err)
 	}
-	defer stubL.Close()
+	// Fix #3: defer in LIFO order — Close first, then Remove.
 	defer os.Remove(stubSocket)
+	defer stubL.Close()
 
 	received := make(chan []byte, 1)
 	go func() {
@@ -32,10 +34,13 @@ func TestE2ERelay(t *testing.T) {
 		}
 		defer conn.Close()
 		buf := make([]byte, 1024)
-		n, _ := conn.Read(buf)
-		received <- buf[:n]
-		// Echo it back so the relay has data to send.
-		conn.Write(buf[:n])
+		// Fix #4: use io.ReadFull to avoid partial reads.
+		want := []byte("hello X server")
+		if _, err := io.ReadFull(conn, buf[:len(want)]); err != nil {
+			return
+		}
+		received <- append([]byte(nil), buf[:len(want)]...)
+		conn.Write(buf[:len(want)])
 	}()
 
 	// Start proxxxy-server on display :97, TCP port 17197.
@@ -45,8 +50,8 @@ func TestE2ERelay(t *testing.T) {
 	}
 	defer s.Stop()
 
-	// Connect a proxxxy-client stub: do the handshake, set DISPLAY=:98.
-	t.Setenv("DISPLAY", ":98")
+	// Connect a proxxxy-client stub: do the handshake.
+	// Fix #1: removed dead t.Setenv("DISPLAY", ":98") — nothing reads it.
 	clientConn, err := net.Dial("tcp", "127.0.0.1:17197")
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +81,10 @@ func TestE2ERelay(t *testing.T) {
 
 	// App sends some bytes.
 	want := []byte("hello X server")
-	appConn.Write(want)
+	// Fix #5: check write error.
+	if _, err := appConn.Write(want); err != nil {
+		t.Fatal("write to app:", err)
+	}
 
 	// The client stub (which would forward to :98) should receive them as X11_DATA.
 	clientConn.SetDeadline(time.Now().Add(2 * time.Second))

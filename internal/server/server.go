@@ -155,10 +155,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// Phase 1: no state to replay.
-	wire.Write(conn, wire.MsgSessionResume, nil)
-	wire.Write(conn, wire.MsgSessionLive, nil)
-
+	// Set clientConn before announcing live, so data isn't dropped.
 	s.mu.Lock()
 	s.clientConn = conn
 	s.mu.Unlock()
@@ -169,6 +166,10 @@ func (s *Server) handleClient(conn net.Conn) {
 		}
 		s.mu.Unlock()
 	}()
+
+	// Phase 1: no state to replay.
+	wire.Write(conn, wire.MsgSessionResume, nil)
+	wire.Write(conn, wire.MsgSessionLive, nil)
 
 	log.Println("server: client connected")
 	s.readFromClient(conn)

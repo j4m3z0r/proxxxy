@@ -130,16 +130,8 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 		enc.OnClientDisconnect()
 	}()
 
-	drainRequests(app, ac, enc, func(msg wire.Msg) {
-		s.mu.Lock()
-		c := s.clientConn
-		s.mu.Unlock()
-		if c == nil {
-			return
-		}
-		s.clientW.Lock()
-		wire.Write(c, msg.Type, msg.Payload)
-		s.clientW.Unlock()
+	drainRequests(app, ac, enc, func(data []byte) {
+		s.sendToClient(connID, data)
 	})
 }
 

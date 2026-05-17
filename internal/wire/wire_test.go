@@ -75,3 +75,23 @@ func TestOversizedMessageRejected(t *testing.T) {
 		t.Fatal("expected error for oversized message")
 	}
 }
+
+func TestParseCompressedMsg(t *testing.T) {
+	payload := []byte{0x07, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC}
+	connID, rest, err := wire.ParseCompressedMsg(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connID != 7 {
+		t.Fatalf("connID: got %d want 7", connID)
+	}
+	if !bytes.Equal(rest, []byte{0xAA, 0xBB, 0xCC}) {
+		t.Fatalf("rest: got %x want aabbcc", rest)
+	}
+
+	// Too short.
+	_, _, err = wire.ParseCompressedMsg([]byte{0x01, 0x02, 0x03})
+	if err == nil {
+		t.Fatal("expected error for 3-byte payload")
+	}
+}

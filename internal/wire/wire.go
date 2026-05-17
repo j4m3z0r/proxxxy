@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	ProtocolVersion uint32 = 1
+	ProtocolVersion uint32 = 2
 
 	MsgHello          byte = 0x01
 	MsgSessionResume  byte = 0x02
@@ -92,6 +92,16 @@ func WriteX11Data(w io.Writer, connID uint32, data []byte) error {
 func ParseX11Data(payload []byte) (connID uint32, data []byte, err error) {
 	if len(payload) < 4 {
 		return 0, nil, fmt.Errorf("wire: X11_DATA payload too short (%d bytes)", len(payload))
+	}
+	return binary.LittleEndian.Uint32(payload[:4]), payload[4:], nil
+}
+
+// ParseCompressedMsg splits a compressed message payload (MsgDictDefine,
+// MsgDictRef, MsgDictExpire, MsgTemplateDefine, MsgTemplateApply) into
+// connID and the remainder of the payload.
+func ParseCompressedMsg(payload []byte) (connID uint32, rest []byte, err error) {
+	if len(payload) < 4 {
+		return 0, nil, fmt.Errorf("wire: compressed msg payload too short (%d bytes)", len(payload))
 	}
 	return binary.LittleEndian.Uint32(payload[:4]), payload[4:], nil
 }

@@ -23,9 +23,9 @@ func NewDecoder() *Decoder {
 }
 
 // Decode reconstructs the original X11 bytes from a compressed wire message.
-// Returns connID extracted from the payload, the reconstructed bytes (nil for
-// define/expire messages that carry no X11 data), and any parse error.
-// MsgX11Data is not handled here; the caller continues to handle it directly.
+// Returns connID extracted from the payload, the reconstructed X11 bytes
+// (nil for TemplateDefine and DictExpire which carry no forwarding data),
+// and any parse error. MsgX11Data is not handled here.
 func (d *Decoder) Decode(msg wire.Msg) (connID uint32, data []byte, err error) {
 	if len(msg.Payload) < 4 {
 		return 0, nil, fmt.Errorf("decoder: payload too short (%d bytes)", len(msg.Payload))
@@ -53,7 +53,9 @@ func (d *Decoder) Decode(msg wire.Msg) (connID uint32, data []byte, err error) {
 		if !ok {
 			return 0, nil, fmt.Errorf("decoder: DictRef unknown id %d", id)
 		}
-		return connID, entry, nil
+		out := make([]byte, len(entry))
+		copy(out, entry)
+		return connID, out, nil
 
 	case wire.MsgDictExpire:
 		if len(rest) < 8 {

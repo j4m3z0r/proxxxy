@@ -18,6 +18,7 @@ const (
 
 type dictEntry struct {
 	id       uint64
+	fp       uint64
 	data     []byte
 	inClient bool
 	elem     *list.Element // position in LRU list
@@ -64,6 +65,9 @@ func (d *Dict) Classify(seq []byte) (Action, uint64, []byte) {
 	}
 
 	needed := len(seq)
+	if needed > d.capacity {
+		return ActionPassthrough, 0, nil
+	}
 	for d.used+needed > d.capacity && d.lru.Len() > 0 {
 		d.evictLRU()
 	}
@@ -72,7 +76,7 @@ func (d *Dict) Classify(seq []byte) (Action, uint64, []byte) {
 	id := d.nextID
 	cp := make([]byte, len(seq))
 	copy(cp, seq)
-	e := &dictEntry{id: id, data: cp, inClient: true}
+	e := &dictEntry{id: id, fp: fp, data: cp, inClient: true}
 	e.elem = d.lru.PushFront(e)
 	d.byFP[fp] = e
 	d.used += len(seq)
@@ -86,12 +90,7 @@ func (d *Dict) evictLRU() {
 	}
 	e := back.Value.(*dictEntry)
 	d.lru.Remove(back)
-	for fp, entry := range d.byFP {
-		if entry == e {
-			delete(d.byFP, fp)
-			break
-		}
-	}
+	delete(d.byFP, e.fp)
 	d.used -= len(e.data)
 	if e.inClient {
 		d.expiredIDs = append(d.expiredIDs, e.id)

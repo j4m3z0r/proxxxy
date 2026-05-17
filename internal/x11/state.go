@@ -275,47 +275,51 @@ func (a *AppConn) GC(id uint32) *GC {
 	return a.gcs[id]
 }
 
-// Windows returns a snapshot of all tracked windows.
-func (a *AppConn) Windows() map[uint32]*Window {
+// Windows returns a snapshot of all tracked windows with deep-copied slices.
+func (a *AppConn) Windows() map[uint32]Window {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	out := make(map[uint32]*Window, len(a.windows))
+	out := make(map[uint32]Window, len(a.windows))
 	for k, v := range a.windows {
-		out[k] = v
+		w := *v                                          // copy struct
+		w.Children = append([]uint32(nil), v.Children...) // deep copy slice
+		out[k] = w
 	}
 	return out
 }
 
 // GCs returns a snapshot of all tracked graphics contexts.
-func (a *AppConn) GCs() map[uint32]*GC {
+func (a *AppConn) GCs() map[uint32]GC {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	out := make(map[uint32]*GC, len(a.gcs))
+	out := make(map[uint32]GC, len(a.gcs))
 	for k, v := range a.gcs {
-		out[k] = v
+		out[k] = *v // copy struct (ChangeCmds is a slice but synthesis doesn't use it)
 	}
 	return out
 }
 
-// Pixmaps returns a snapshot of all tracked pixmaps.
-func (a *AppConn) Pixmaps() map[uint32]*Pixmap {
+// Pixmaps returns a snapshot of all tracked pixmaps with deep-copied slices.
+func (a *AppConn) Pixmaps() map[uint32]Pixmap {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	out := make(map[uint32]*Pixmap, len(a.pixmaps))
+	out := make(map[uint32]Pixmap, len(a.pixmaps))
 	for k, v := range a.pixmaps {
-		out[k] = v
+		p := *v                                          // copy struct
+		p.DrawCmds = append([][]byte(nil), v.DrawCmds...) // deep copy slice of slices
+		out[k] = p
 	}
 	return out
 }
 
 // CreateReq returns the raw X11 CreateWindow request bytes.
-func (w *Window) CreateReq() []byte { return w.createReq }
+func (w Window) CreateReq() []byte { return w.createReq }
 
 // CreateReq returns the raw X11 CreateGC request bytes.
-func (g *GC) CreateReq() []byte { return g.createReq }
+func (g GC) CreateReq() []byte { return g.createReq }
 
 // CreateReq returns the raw X11 CreatePixmap request bytes.
-func (p *Pixmap) CreateReq() []byte { return p.createReq }
+func (p Pixmap) CreateReq() []byte { return p.createReq }
 
 func removeID(s []uint32, id uint32) []uint32 {
 	out := s[:0]

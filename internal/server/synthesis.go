@@ -32,27 +32,27 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	windows := ac.Windows()
 	roots := findRoots(windows)
 	for _, root := range roots {
-		s.synthesiseWindowTree(ac, windows, root)
+		s.synthesiseWindowTree(ac.ID, windows, root, ac.Order)
 	}
 }
 
-func (s *Server) synthesiseWindowTree(ac *x11.AppConn, all map[uint32]*x11.Window, wid uint32) {
+func (s *Server) synthesiseWindowTree(connID uint32, all map[uint32]x11.Window, wid uint32, order binary.ByteOrder) {
 	w, ok := all[wid]
 	if !ok {
 		return
 	}
 	if cr := w.CreateReq(); len(cr) > 0 {
-		s.sendToClient(ac.ID, cr)
+		s.sendToClient(connID, cr)
 	}
 	if w.Mapped {
-		s.sendToClient(ac.ID, makeMapWindow(wid, ac.Order))
+		s.sendToClient(connID, makeMapWindow(wid, order))
 	}
 	for _, child := range w.Children {
-		s.synthesiseWindowTree(ac, all, child)
+		s.synthesiseWindowTree(connID, all, child, order)
 	}
 }
 
-func findRoots(windows map[uint32]*x11.Window) []uint32 {
+func findRoots(windows map[uint32]x11.Window) []uint32 {
 	var roots []uint32
 	for id, w := range windows {
 		if _, hasParent := windows[w.Parent]; !hasParent {

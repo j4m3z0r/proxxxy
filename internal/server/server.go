@@ -156,11 +156,34 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 		enc.OnClientDisconnect()
 	}()
 
-	drainRequests(app, ac, enc, func(data []byte) {
-		enc.Stats.BytesIn.Add(int64(len(data)))
-		s.sendToClient(connID, data)
-		enc.Stats.BytesOut.Add(int64(len(data)))
+	drainRequests(app, ac, enc, func(msgs []wire.Msg) {
+		var out int64
+		for _, m := range msgs {
+			out += int64(len(m.Payload))
+		}
+		enc.Stats.BytesOut.Add(out)
+		s.sendMsgsToClient(msgs)
 	})
+}
+
+func (s *Server) sendMsgsToClient(msgs []wire.Msg) {
+	if len(msgs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	c := s.clientConn
+	s.mu.Unlock()
+	if c == nil {
+		return
+	}
+	s.clientW.Lock()
+	defer s.clientW.Unlock()
+	for _, msg := range msgs {
+		if err := wire.Write(c, msg.Type, msg.Payload); err != nil {
+			log.Println("server: write to client:", err)
+			return
+		}
+	}
 }
 
 func (s *Server) sendToClient(connID uint32, data []byte) {

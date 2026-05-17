@@ -58,8 +58,9 @@ func (e *Encoder) DrainExpiredDicts() []wire.Msg {
 	ids := e.dict.DrainExpired()
 	msgs := make([]wire.Msg, len(ids))
 	for i, id := range ids {
-		p := make([]byte, 8)
-		binary.LittleEndian.PutUint64(p, id)
+		p := make([]byte, 12)
+		binary.LittleEndian.PutUint32(p[:4], e.connID)
+		binary.LittleEndian.PutUint64(p[4:], id)
 		msgs[i] = wire.Msg{Type: wire.MsgDictExpire, Payload: p}
 	}
 	return msgs
@@ -76,12 +77,12 @@ func (e *Encoder) encodeOne(cmd []byte) []wire.Msg {
 			if isNew {
 				e.Stats.TemplateDefs.Add(1)
 				return []wire.Msg{
-					makeTemplateDefine(tmpl),
-					makeTemplateApply(tmpl.ID, params),
+					makeTemplateDefine(e.connID, tmpl),
+					makeTemplateApply(e.connID, tmpl.ID, params),
 				}
 			}
 			e.Stats.TemplateHits.Add(1)
-			return []wire.Msg{makeTemplateApply(tmpl.ID, params)}
+			return []wire.Msg{makeTemplateApply(e.connID, tmpl.ID, params)}
 		}
 	}
 	e.prev[opcode] = cmd
@@ -91,10 +92,10 @@ func (e *Encoder) encodeOne(cmd []byte) []wire.Msg {
 	switch action {
 	case ActionDefine:
 		e.Stats.DictDefines.Add(1)
-		return []wire.Msg{makeDictDefine(id, data)}
+		return []wire.Msg{makeDictDefine(e.connID, id, data)}
 	case ActionRef:
 		e.Stats.DictHits.Add(1)
-		return []wire.Msg{makeDictRef(id)}
+		return []wire.Msg{makeDictRef(e.connID, id)}
 	}
 	// ActionPassthrough — sequence too large for dict.
 	e.Stats.DictPasses.Add(1)
@@ -104,25 +105,28 @@ func (e *Encoder) encodeOne(cmd []byte) []wire.Msg {
 	return []wire.Msg{{Type: wire.MsgX11Data, Payload: p}}
 }
 
-func makeDictDefine(id uint64, data []byte) wire.Msg {
-	p := make([]byte, 8+len(data))
-	binary.LittleEndian.PutUint64(p[:8], id)
-	copy(p[8:], data)
+func makeDictDefine(connID uint32, id uint64, data []byte) wire.Msg {
+	p := make([]byte, 4+8+len(data))
+	binary.LittleEndian.PutUint32(p[:4], connID)
+	binary.LittleEndian.PutUint64(p[4:], id)
+	copy(p[12:], data)
 	return wire.Msg{Type: wire.MsgDictDefine, Payload: p}
 }
 
-func makeDictRef(id uint64) wire.Msg {
-	p := make([]byte, 8)
-	binary.LittleEndian.PutUint64(p, id)
+func makeDictRef(connID uint32, id uint64) wire.Msg {
+	p := make([]byte, 4+8)
+	binary.LittleEndian.PutUint32(p[:4], connID)
+	binary.LittleEndian.PutUint64(p[4:], id)
 	return wire.Msg{Type: wire.MsgDictRef, Payload: p}
 }
 
-func makeTemplateDefine(tmpl *Template) wire.Msg {
+func makeTemplateDefine(connID uint32, tmpl *Template) wire.Msg {
 	slots := tmpl.Slots()
-	p := make([]byte, 8+2+len(slots)*8+len(tmpl.base))
-	binary.LittleEndian.PutUint64(p[:8], tmpl.ID)
-	binary.LittleEndian.PutUint16(p[8:], uint16(len(slots)))
-	off := 10
+	p := make([]byte, 4+8+2+len(slots)*8+len(tmpl.base))
+	binary.LittleEndian.PutUint32(p[:4], connID)
+	binary.LittleEndian.PutUint64(p[4:], tmpl.ID)
+	binary.LittleEndian.PutUint16(p[12:], uint16(len(slots)))
+	off := 14
 	for _, s := range slots {
 		binary.LittleEndian.PutUint32(p[off:], uint32(s.Offset))
 		binary.LittleEndian.PutUint32(p[off+4:], uint32(s.Length))
@@ -132,15 +136,16 @@ func makeTemplateDefine(tmpl *Template) wire.Msg {
 	return wire.Msg{Type: wire.MsgTemplateDefine, Payload: p}
 }
 
-func makeTemplateApply(id uint64, params [][]byte) wire.Msg {
-	total := 10
+func makeTemplateApply(connID uint32, id uint64, params [][]byte) wire.Msg {
+	total := 4 + 10 // connID + id(8) + nparams(2)
 	for _, p := range params {
 		total += 2 + len(p)
 	}
 	buf := make([]byte, total)
-	binary.LittleEndian.PutUint64(buf[:8], id)
-	binary.LittleEndian.PutUint16(buf[8:], uint16(len(params)))
-	off := 10
+	binary.LittleEndian.PutUint32(buf[:4], connID)
+	binary.LittleEndian.PutUint64(buf[4:], id)
+	binary.LittleEndian.PutUint16(buf[12:], uint16(len(params)))
+	off := 14
 	for _, p := range params {
 		binary.LittleEndian.PutUint16(buf[off:], uint16(len(p)))
 		copy(buf[off+2:], p)

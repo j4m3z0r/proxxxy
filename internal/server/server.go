@@ -238,6 +238,12 @@ func (s *Server) handleClient(conn net.Conn) {
 		}
 		s.mu.Unlock()
 	}()
+	defer func() {
+		s.encoders.Range(func(_, val any) bool {
+			val.(*compress.Encoder).OnClientDisconnect()
+			return true
+		})
+	}()
 
 	// Phase 2: synthesise existing X11 state for the reconnecting client.
 	s.runSynthesis()

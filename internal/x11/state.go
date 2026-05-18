@@ -1,6 +1,7 @@
 package x11
 
 import (
+	"log"
 	"sync"
 )
 
@@ -49,12 +50,15 @@ type AppConn struct {
 	ID    uint32
 	Order ByteOrder
 
-	mu      sync.RWMutex
-	windows map[uint32]*Window
-	gcs     map[uint32]*GC
-	pixmaps map[uint32]*Pixmap
-	fonts   map[uint32]*Font
-	seqNum  uint32
+	mu       sync.RWMutex
+	windows  map[uint32]*Window
+	gcs      map[uint32]*GC
+	pixmaps  map[uint32]*Pixmap
+	fonts    map[uint32]*Font
+	seqNum   uint32
+	setupReq []byte // X11 connection setup request from app
+	ridBase  uint32 // resource-id-base from real X server setup reply
+	ridMask  uint32 // resource-id-mask from real X server setup reply
 }
 
 func NewAppConn(id uint32, order ByteOrder) *AppConn {
@@ -80,8 +84,12 @@ func (a *AppConn) ProcessRequest(req []byte) {
 	switch opcode {
 	case OpcodeCreateWindow:
 		a.handleCreateWindow(req)
+	case OpcodeConfigureWindow:
+		a.handleConfigureWindow(req)
 	case OpcodeMapWindow:
 		a.handleMapWindow(req)
+	case OpcodeMapSubwindows:
+		a.handleMapSubwindows(req)
 	case OpcodeUnmapWindow:
 		a.handleUnmapWindow(req)
 	case OpcodeDestroyWindow:
@@ -130,13 +138,64 @@ func (a *AppConn) handleCreateWindow(req []byte) {
 	}
 }
 
+func (a *AppConn) handleConfigureWindow(req []byte) {
+	// Layout: [opcode:1][pad:1][len:2][window:4][value-mask:2][pad:2][values...]
+	if len(req) < 12 {
+		return
+	}
+	wid := U32(req, 4, a.Order)
+	w, ok := a.windows[wid]
+	if !ok {
+		return
+	}
+	mask := uint32(a.Order.Uint16(req[8:10]))
+	off := 0
+	val := func() uint32 {
+		v := U32(req, 12+off*4, a.Order)
+		off++
+		return v
+	}
+	if mask&(1<<0) != 0 { w.X = int16(val()) }
+	if mask&(1<<1) != 0 { w.Y = int16(val()) }
+	if mask&(1<<2) != 0 { w.Width = uint16(val()) }
+	if mask&(1<<3) != 0 { w.Height = uint16(val()) }
+	if mask&(1<<4) != 0 { w.BorderWidth = uint16(val()) }
+	// Patch createReq so synthesis replays the correct geometry.
+	if len(w.createReq) >= 20 {
+		a.Order.PutUint16(w.createReq[12:], uint16(w.X))
+		a.Order.PutUint16(w.createReq[14:], uint16(w.Y))
+		a.Order.PutUint16(w.createReq[16:], w.Width)
+		a.Order.PutUint16(w.createReq[18:], w.Height)
+		a.Order.PutUint16(w.createReq[20:], w.BorderWidth)
+	}
+}
+
 func (a *AppConn) handleMapWindow(req []byte) {
 	if len(req) < 8 {
 		return
 	}
 	id := U32(req, 4, a.Order)
 	if w, ok := a.windows[id]; ok {
+		log.Printf("x11: conn %d MapWindow 0x%08x (was mapped=%v)", a.ID, id, w.Mapped)
 		w.Mapped = true
+	} else {
+		log.Printf("x11: conn %d MapWindow 0x%08x (unknown window)", a.ID, id)
+	}
+}
+
+func (a *AppConn) handleMapSubwindows(req []byte) {
+	if len(req) < 8 {
+		return
+	}
+	parentID := U32(req, 4, a.Order)
+	log.Printf("x11: conn %d MapSubwindows 0x%08x", a.ID, parentID)
+	if w, ok := a.windows[parentID]; ok {
+		for _, childID := range w.Children {
+			if child, ok2 := a.windows[childID]; ok2 {
+				log.Printf("x11: conn %d MapSubwindows -> MapWindow 0x%08x", a.ID, childID)
+				child.Mapped = true
+			}
+		}
 	}
 }
 
@@ -146,6 +205,7 @@ func (a *AppConn) handleUnmapWindow(req []byte) {
 	}
 	id := U32(req, 4, a.Order)
 	if w, ok := a.windows[id]; ok {
+		log.Printf("x11: conn %d UnmapWindow 0x%08x (was mapped=%v)", a.ID, id, w.Mapped)
 		w.Mapped = false
 	}
 }
@@ -309,6 +369,42 @@ func (a *AppConn) Pixmaps() map[uint32]Pixmap {
 		out[k] = p
 	}
 	return out
+}
+
+// SeqNum returns the number of requests the app has sent on this connection.
+func (a *AppConn) SeqNum() uint32 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.seqNum
+}
+
+// SetSetupReq stores the raw X11 connection setup request sent by the app.
+func (a *AppConn) SetSetupReq(b []byte) {
+	a.mu.Lock()
+	a.setupReq = b
+	a.mu.Unlock()
+}
+
+// SetupReq returns the stored connection setup request bytes.
+func (a *AppConn) SetupReq() []byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.setupReq
+}
+
+// SetRID records the resource-id-base and resource-id-mask from the real X server.
+func (a *AppConn) SetRID(base, mask uint32) {
+	a.mu.Lock()
+	a.ridBase = base
+	a.ridMask = mask
+	a.mu.Unlock()
+}
+
+// RID returns the stored resource-id-base and resource-id-mask.
+func (a *AppConn) RID() (base, mask uint32) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.ridBase, a.ridMask
 }
 
 // CreateReq returns the raw X11 CreateWindow request bytes.

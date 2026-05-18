@@ -52,6 +52,18 @@ func ParseRequestHeaderOrder(b []byte, order ByteOrder) (RequestHeader, error) {
 	}, nil
 }
 
+// ParseSetupReply extracts the resource-id-base and resource-id-mask from a
+// successful X11 server setup reply. Returns (0, 0, false) if the data is not
+// a success reply or is too short.
+func ParseSetupReply(b []byte, order ByteOrder) (base, mask uint32, ok bool) {
+	// Setup reply layout: [success:1][pad:1][major:2][minor:2][len:2][data…]
+	// additional data: [release:4][resource-id-base:4][resource-id-mask:4]…
+	if len(b) < 20 || b[0] != 1 {
+		return 0, 0, false
+	}
+	return order.Uint32(b[12:16]), order.Uint32(b[16:20]), true
+}
+
 // U32 reads a uint32 at offset off from b using the given byte order.
 func U32(b []byte, off int, order ByteOrder) uint32 {
 	return order.Uint32(b[off : off+4])

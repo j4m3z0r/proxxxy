@@ -13,6 +13,7 @@ const (
 	MsgSessionResume  byte = 0x02
 	MsgSessionLive    byte = 0x03
 	MsgX11Data        byte = 0x04
+	MsgX11Setup       byte = 0x05 // connID(4)+ridBase(4)+ridMask(4)+setupReq
 	MsgDictDefine     byte = 0x10
 	MsgDictRef        byte = 0x11
 	MsgDictExpire     byte = 0x12

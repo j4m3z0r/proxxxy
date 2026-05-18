@@ -28,9 +28,14 @@ func NewEncoder(connID uint32, dictCapacity int) *Encoder {
 	}
 }
 
-// OnClientDisconnect resets the client-side view of the dictionary.
+// OnClientDisconnect resets all client-side state so a fresh client starts
+// with a clean slate. The dict tracks which entries have been sent (reset via
+// ClientDisconnected). Templates have no such server-side persistence — a new
+// client has never seen any TemplateDefine, so the registry must be cleared.
 func (e *Encoder) OnClientDisconnect() {
 	e.dict.ClientDisconnected()
+	e.templates = NewTemplateRegistry()
+	e.prev = make(map[byte][]byte)
 }
 
 // Encode processes one X11 command and returns a sequence of wire messages to

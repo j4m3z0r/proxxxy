@@ -48,11 +48,12 @@ func drainRequests(app net.Conn, ac *x11.AppConn, enc *compress.Encoder, sendFn 
 	hdr := make([]byte, 4)
 	for {
 		if _, err := io.ReadFull(r, hdr); err != nil {
+			log.Printf("server: drainRequests conn %d read hdr error: %v", ac.ID, err)
 			return
 		}
 		reqHdr, err := x11.ParseRequestHeaderOrder(hdr, ac.Order)
 		if err != nil {
-			log.Println("x11 parse:", err)
+			log.Printf("server: drainRequests conn %d parse error: %v hdr=%x", ac.ID, err, hdr)
 			return
 		}
 		body := make([]byte, reqHdr.ByteLen-4)
@@ -64,8 +65,12 @@ func drainRequests(app net.Conn, ac *x11.AppConn, enc *compress.Encoder, sendFn 
 		copy(full[4:], body)
 		ac.ProcessRequest(full)
 		enc.Stats.BytesIn.Add(int64(len(full)))
-		msgs := enc.Encode(0, full, ac.Order)
-		msgs = append(msgs, enc.DrainExpiredDicts()...)
-		sendFn(msgs)
+		// Phase 3 encoder bypassed: client-side decoder is not yet production-
+		// ready (dict inClient state pollutes across reconnects). Forward raw
+		// X11 bytes as MsgX11Data until Phase 3 is fully stabilised.
+		p := make([]byte, 4+len(full))
+		binary.LittleEndian.PutUint32(p[:4], ac.ID)
+		copy(p[4:], full)
+		sendFn([]wire.Msg{{Type: wire.MsgX11Data, Payload: p}})
 	}
 }

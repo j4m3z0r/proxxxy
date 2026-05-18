@@ -125,6 +125,7 @@ func (s *Server) acceptX11(l net.Listener) {
 
 func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 	defer func() {
+		log.Printf("server: relayAppToClient conn %d exiting, closing app socket", connID)
 		app.Close()
 		s.mu.Lock()
 		delete(s.appConns, connID)
@@ -133,19 +134,22 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 
 	// Read connection setup, capture bytes, then forward synchronously.
 	var setupBuf bytes.Buffer
-	order, _, err := parseConnSetup(app, &setupBuf)
+	order, setupBytes, err := parseConnSetup(app, &setupBuf)
 	if err != nil {
 		return
 	}
-	if setupBuf.Len() > 0 {
-		s.sendToClient(connID, setupBuf.Bytes())
-	}
-
 	ac := x11.NewAppConn(connID, order)
+	ac.SetSetupReq(setupBytes)
 	enc := compress.NewEncoder(connID, 4*1024*1024) // 4 MB dict per connection
+	// Store appState before forwarding setup bytes so the setup reply that
+	// arrives in readFromClient can find the AppConn and record ridBase.
 	s.mu.Lock()
 	s.appState[connID] = ac
 	s.mu.Unlock()
+
+	if setupBuf.Len() > 0 {
+		s.sendToClient(connID, setupBuf.Bytes())
+	}
 
 	s.encoders.Store(connID, enc)
 	defer func() {
@@ -266,9 +270,18 @@ func (s *Server) readFromClient(conn net.Conn) {
 		if err != nil {
 			continue
 		}
+		// Intercept first data from each new X connection to capture rid.
 		s.mu.Lock()
+		ac := s.appState[connID]
 		app := s.appConns[connID]
 		s.mu.Unlock()
+		if ac != nil {
+			if base, _ := ac.RID(); base == 0 {
+				if b, m, ok := x11.ParseSetupReply(data, ac.Order); ok {
+					ac.SetRID(b, m)
+				}
+			}
+		}
 		if app != nil {
 			if _, werr := app.Write(data); werr != nil {
 				log.Println("server: write to app:", werr)

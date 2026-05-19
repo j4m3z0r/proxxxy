@@ -406,8 +406,16 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 
 	// Phase 1: drain until SESSION_LIVE.
 	for {
-		if _, _, err := readMsg(); err != nil {
+		msgType, _, err := readMsg()
+		if err != nil {
 			return
+		}
+		if msgType == 0 {
+			badID := order.Uint32(hdr[4:8])
+			minor := order.Uint16(hdr[8:10])
+			major := hdr[10]
+			log.Printf("client: synthRelay conn %d: X error during synthesis: code=%d major=%d minor=%d badID=0x%08x",
+				connID, hdr[1], major, minor, badID)
 		}
 		select {
 		case <-done:
@@ -424,21 +432,33 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 	barrierReq := [4]byte{x11.OpcodeGetInputFocus, 0}
 	order.PutUint16(barrierReq[2:], 1) // length = 1 unit (4 bytes)
 	if _, err := xconn.Write(barrierReq[:]); err != nil {
+		log.Printf("client: synthRelay conn %d: write GetInputFocus: %v", connID, err)
 		return
 	}
 	for {
 		msgType, _, err := readMsg()
 		if err != nil {
+			log.Printf("client: synthRelay conn %d: barrier drain read error: %v hdr[0]=%d", connID, err, hdr[0])
 			return
 		}
+		if msgType == 0 {
+			badID := order.Uint32(hdr[4:8])
+			minor := order.Uint16(hdr[8:10])
+			major := hdr[10]
+			log.Printf("client: synthRelay conn %d: X error during barrier: code=%d major=%d minor=%d badID=0x%08x",
+				connID, hdr[1], major, minor, badID)
+		}
 		if msgType == 1 {
-			break // GetInputFocus reply — all synthesis events drained
+			log.Printf("client: synthRelay conn %d: barrier GetInputFocus reply received, entering drain mode", connID)
+			break
 		}
 	}
 
 	// Phase 2 continued: drain forever — conn stays open, events discarded.
 	for {
-		if _, _, err := readMsg(); err != nil {
+		_, _, err := readMsg()
+		if err != nil {
+			log.Printf("client: synthRelay conn %d: drain-forever read error: %v", connID, err)
 			return
 		}
 	}

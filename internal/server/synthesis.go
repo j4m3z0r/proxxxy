@@ -37,13 +37,15 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	windows := ac.Windows()
 	roots := findRoots(windows)
 	for _, root := range roots {
-		s.synthesiseWindowCreate(ac.ID, windows, root)
+		s.synthesiseWindowCreate(ac.ID, windows, root, ac.Order)
 	}
 
 	// 2. Pixmaps: create only (draw commands come after GCs, which they reference).
 	pixmaps := ac.Pixmaps()
 	for _, pm := range pixmaps {
 		if cr := pm.CreateReq(); len(cr) > 0 {
+			log.Printf("server: synthesis conn %d: CreatePixmap 0x%08x %dx%d depth=%d len=%d",
+				ac.ID, pm.ID, pm.Width, pm.Height, pm.Depth, len(cr))
 			s.sendToClient(ac.ID, cr)
 		}
 	}
@@ -52,6 +54,9 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	// Must come before pixmap draw commands since draws reference GC IDs.
 	for _, gc := range ac.GCs() {
 		if cr := gc.CreateReq(); len(cr) > 0 {
+			cr = sanitizeGCDrawable(cr, gc.Drawable, windows, pixmaps, ac.Order)
+			log.Printf("server: synthesis conn %d: CreateGC 0x%08x drawable=0x%08x len=%d",
+				ac.ID, gc.ID, gc.Drawable, len(cr))
 			s.sendToClient(ac.ID, cr)
 		}
 		for _, cmd := range gc.ChangeCmds {
@@ -74,18 +79,19 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 
 // synthesiseWindowCreate sends CreateWindow for a window and its subtree
 // (without mapping them yet).
-func (s *Server) synthesiseWindowCreate(connID uint32, all map[uint32]x11.Window, wid uint32) {
+func (s *Server) synthesiseWindowCreate(connID uint32, all map[uint32]x11.Window, wid uint32, order binary.ByteOrder) {
 	w, ok := all[wid]
 	if !ok {
 		return
 	}
 	if cr := w.CreateReq(); len(cr) > 0 {
+		cr = sanitizeCreateWindow(cr, order)
 		log.Printf("server: synthesis conn %d: CreateWindow 0x%08x parent=0x%08x mapped=%v len=%d",
 			connID, w.ID, w.Parent, w.Mapped, len(cr))
 		s.sendToClient(connID, cr)
 	}
 	for _, child := range w.Children {
-		s.synthesiseWindowCreate(connID, all, child)
+		s.synthesiseWindowCreate(connID, all, child, order)
 	}
 }
 
@@ -122,6 +128,69 @@ func (s *Server) synthesisExpose(ac *x11.AppConn) {
 		evt := makeExposeEvent(w.ID, w.Width, w.Height, seqNum, ac.Order)
 		app.Write(evt) //nolint:errcheck
 	}
+}
+
+// sanitizeCreateWindow removes the CWColormap attribute from a CreateWindow
+// request and resets depth and visual to CopyFromParent (0). This prevents
+// synthesis from failing when the original colormap was created by a
+// now-dead X connection: without CWColormap, X inherits the parent's colormap,
+// and without an explicit visual/depth, X inherits those too (always valid for
+// children of the root window).
+func sanitizeCreateWindow(req []byte, order binary.ByteOrder) []byte {
+	if len(req) < 32 || req[0] != x11.OpcodeCreateWindow {
+		return req
+	}
+	valueMask := order.Uint32(req[28:32])
+	if valueMask&(1<<13) == 0 {
+		// No CWColormap — nothing to strip.
+		return req
+	}
+
+	// Locate the colormap value in the value-list (values ordered by bit position).
+	off := 32
+	for bit := uint(0); bit < 13; bit++ {
+		if valueMask&(1<<bit) != 0 {
+			off += 4
+		}
+	}
+	if len(req) < off+4 {
+		return req
+	}
+
+	// Build a new request omitting the 4-byte colormap value.
+	out := make([]byte, len(req)-4)
+	copy(out, req[:off])
+	copy(out[off:], req[off+4:])
+
+	order.PutUint32(out[28:32], valueMask&^uint32(1<<13)) // clear CWColormap
+	out[1] = 0                                             // depth = CopyFromParent
+	order.PutUint32(out[24:28], 0)                         // visual = CopyFromParent
+	order.PutUint16(out[2:4], uint16(len(out)/4))          // recompute length
+	return out
+}
+
+// sanitizeGCDrawable rewrites a CreateGC request to use a fallback drawable if
+// the original drawable no longer exists (e.g., a pixmap that was freed before
+// reconnect). The GC's screen affinity comes from its drawable; substituting any
+// valid window on the same screen keeps the GC usable for drawing.
+func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Window, pixmaps map[uint32]x11.Pixmap, order binary.ByteOrder) []byte {
+	if len(req) < 12 || req[0] != x11.OpcodeCreateGC {
+		return req
+	}
+	if _, ok := windows[drawable]; ok {
+		return req
+	}
+	if _, ok := pixmaps[drawable]; ok {
+		return req
+	}
+	// Drawable is gone — substitute with the first available window.
+	for id := range windows {
+		out := make([]byte, len(req))
+		copy(out, req)
+		order.PutUint32(out[8:12], id)
+		return out
+	}
+	return req // no windows either (shouldn't happen in practice)
 }
 
 func findRoots(windows map[uint32]x11.Window) []uint32 {

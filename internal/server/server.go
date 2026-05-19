@@ -26,13 +26,14 @@ type Server struct {
 	tcpL      net.Listener
 	statsHTTP *http.Server
 
-	mu         sync.Mutex
-	clientConn net.Conn   // current proxxxy-client (nil = none connected)
-	clientW    sync.Mutex // serialises writes to clientConn
-	nextID     atomic.Uint32
-	appConns   map[uint32]net.Conn
-	appState   map[uint32]*x11.AppConn
-	encoders   sync.Map // uint32 connID → *compress.Encoder
+	mu             sync.Mutex
+	clientConn     net.Conn   // current proxxxy-client (nil = none connected)
+	synthActive    bool       // true while runSynthesis is in progress; blocks live relay
+	clientW        sync.Mutex // serialises writes to clientConn
+	nextID         atomic.Uint32
+	appConns       map[uint32]net.Conn
+	appState       map[uint32]*x11.AppConn
+	encoders       sync.Map // uint32 connID → *compress.Encoder
 }
 
 func New(displayNum, tcpPort, statsPort int) *Server {
@@ -176,8 +177,11 @@ func (s *Server) sendMsgsToClient(msgs []wire.Msg) {
 	}
 	s.mu.Lock()
 	c := s.clientConn
+	synth := s.synthActive
 	s.mu.Unlock()
-	if c == nil {
+	if c == nil || synth {
+		// No client, or synthesis in progress — live traffic discarded. Apps
+		// will redraw after the Expose injection that follows SESSION_LIVE.
 		return
 	}
 	s.clientW.Lock()
@@ -231,9 +235,13 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// Set clientConn before announcing live, so data isn't dropped.
+	// Block live relay while synthesis runs so that app requests don't race
+	// with synthesis commands on the new X connection. Set clientConn so
+	// synthesis can write to the client, but synthActive=true makes
+	// sendMsgsToClient discard live traffic until synthesis is complete.
 	s.mu.Lock()
 	s.clientConn = conn
+	s.synthActive = true
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -251,6 +259,10 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	// Phase 2: synthesise existing X11 state for the reconnecting client.
 	s.runSynthesis()
+
+	s.mu.Lock()
+	s.synthActive = false
+	s.mu.Unlock()
 
 	log.Println("server: client connected")
 	s.readFromClient(conn)

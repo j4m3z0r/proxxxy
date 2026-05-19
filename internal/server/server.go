@@ -264,6 +264,10 @@ func (s *Server) handleClient(conn net.Conn) {
 	s.synthActive = false
 	s.mu.Unlock()
 
+	// Unblock apps that connected before this client arrived and are still
+	// waiting for their X11 setup reply.
+	s.relayPendingSetups()
+
 	log.Println("server: client connected")
 	s.readFromClient(conn)
 	log.Println("server: client disconnected")
@@ -299,6 +303,33 @@ func (s *Server) readFromClient(conn net.Conn) {
 				log.Println("server: write to app:", werr)
 			}
 		}
+	}
+}
+
+// relayPendingSetups re-sends setup bytes for app connections that arrived
+// before any proxxxy-client connected. Their setup bytes were dropped at the
+// time (clientConn was nil); sending them now as MsgX11Data causes the client
+// to open a fresh X connection, receive the real setup reply, and forward it
+// back — unblocking the waiting app.
+func (s *Server) relayPendingSetups() {
+	s.mu.Lock()
+	type item struct {
+		connID uint32
+		bytes  []byte
+	}
+	var pending []item
+	for connID, ac := range s.appState {
+		if base, _ := ac.RID(); base == 0 {
+			if sb := ac.SetupReq(); len(sb) > 0 {
+				pending = append(pending, item{connID, sb})
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	for _, p := range pending {
+		log.Printf("server: re-relaying setup for pre-client conn %d", p.connID)
+		s.sendToClient(p.connID, p.bytes)
 	}
 }
 

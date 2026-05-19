@@ -26,10 +26,24 @@ func (s *Server) sendX11Setup(connID uint32, setupReq []byte, ridBase, ridMask, 
 // synthesiseAppConn generates the minimum X11 commands needed to reconstruct
 // the visible state of ac on a fresh client display connection.
 func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
+	setupReq := ac.SetupReq()
+	if len(setupReq) == 0 {
+		return
+	}
+	ridBase, ridMask := ac.RID()
+	if ridBase == 0 {
+		// App connected before any proxxxy-client joined and is still blocked
+		// waiting for its X11 setup reply. Skip synthesis here; after
+		// synthActive is cleared, relayPendingSetups will re-send the setup
+		// bytes so the client opens a fresh X connection and the real setup
+		// reply reaches the waiting app.
+		log.Printf("server: synthesis conn %d: skipping (pending setup reply)", ac.ID)
+		return
+	}
+
 	// 0. Connection setup — must arrive first so the client can establish
 	//    a real X connection before any resource-creation commands follow.
-	if setupReq := ac.SetupReq(); len(setupReq) > 0 {
-		ridBase, ridMask := ac.RID()
+	{
 		log.Printf("server: synthesis conn %d: ridBase=0x%08x ridMask=0x%08x setupLen=%d",
 			ac.ID, ridBase, ridMask, len(setupReq))
 		s.sendX11Setup(ac.ID, setupReq, ridBase, ridMask, ac.SeqNum())

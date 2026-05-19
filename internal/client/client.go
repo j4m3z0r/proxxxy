@@ -191,14 +191,15 @@ func (c *Client) Run() error {
 // the server's reply without forwarding it), extracts the new resource-id-base
 // for ID remapping, and defers the relay goroutine start until SESSION_LIVE.
 func (c *Client) handleX11Setup(payload []byte) {
-	if len(payload) < 12 {
+	if len(payload) < 16 {
 		log.Println("client: X11Setup payload too short")
 		return
 	}
 	connID := binary.LittleEndian.Uint32(payload[0:4])
 	oldBase := binary.LittleEndian.Uint32(payload[4:8])
 	oldMask := binary.LittleEndian.Uint32(payload[8:12])
-	setupBytes := payload[12:]
+	appSeqNum := binary.LittleEndian.Uint32(payload[12:16])
+	setupBytes := payload[16:]
 	if len(setupBytes) == 0 {
 		return
 	}
@@ -249,7 +250,7 @@ func (c *Client) handleX11Setup(payload []byte) {
 	done := make(chan struct{})
 	c.synthDone[connID] = done
 	c.mu.Unlock()
-	go c.synthRelay(connID, xconn, done, order)
+	go c.synthRelay(connID, xconn, done, order, appSeqNum)
 }
 
 // readAndConsumeSetupReply reads and discards one X11 server setup reply from
@@ -366,18 +367,22 @@ func (c *Client) handleCompressed(msg wire.Msg) {
 }
 
 // synthRelay manages the X connection created for a synthesised app connection.
-// It runs in two phases:
+// It runs in three phases:
 //
 //  1. Drain (SESSION_RESUME): discard all messages from the synthesis conn.
 //     Synthesis requests (CreateWindow, MapWindow, etc.) generate events with
 //     synthesis-internal sequence numbers that would confuse the app's Xlib.
 //
-//  2. Barrier drain (after SESSION_LIVE): send GetInputFocus to flush any
-//     remaining synthesis-phase events from the socket, then drain forever.
-//     The synthesis conn stays open to keep its X resources alive; we never
-//     forward events or replies because they carry synthesis-internal sequence
-//     numbers incompatible with the app's Xlib state.
-func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{}, order binary.ByteOrder) {
+//  2. Barrier (after SESSION_LIVE): send GetInputFocus and drain until its
+//     reply arrives, flushing any remaining synthesis-phase events.
+//     Capture the reply's sequence number (N_synth) so we can compute the
+//     offset needed to map synthesis xconn seq numbers to app seq numbers.
+//
+//  3. Forward: relay all subsequent messages back to the server (which routes
+//     them to the app), rewriting sequence numbers: new_seq = old_seq + offset,
+//     where offset = uint16(appSeqNum) - N_synth. This keeps the app's Xlib
+//     seq counter consistent as live requests flow through the synthesis conn.
+func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{}, order binary.ByteOrder, appSeqNum uint32) {
 	defer func() {
 		xconn.Close()
 		c.mu.Lock()
@@ -426,41 +431,59 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 		break
 	}
 
-	// Phase 2: barrier drain. Send GetInputFocus so the X server processes it
-	// after all synthesis commands already queued. The first reply we receive
-	// is the GetInputFocus reply; discard everything until then.
+	// Phase 2: barrier. Send GetInputFocus so the X server processes it after
+	// all synthesis commands. Drain until we receive its reply, capturing the
+	// reply's sequence number (N_synth) so we can compute the seq offset.
 	barrierReq := [4]byte{x11.OpcodeGetInputFocus, 0}
 	order.PutUint16(barrierReq[2:], 1) // length = 1 unit (4 bytes)
 	if _, err := xconn.Write(barrierReq[:]); err != nil {
 		log.Printf("client: synthRelay conn %d: write GetInputFocus: %v", connID, err)
 		return
 	}
+	var nSynth uint16
 	for {
 		msgType, _, err := readMsg()
 		if err != nil {
-			log.Printf("client: synthRelay conn %d: barrier drain read error: %v hdr[0]=%d", connID, err, hdr[0])
 			return
 		}
 		if msgType == 0 {
 			badID := order.Uint32(hdr[4:8])
-			minor := order.Uint16(hdr[8:10])
-			major := hdr[10]
-			log.Printf("client: synthRelay conn %d: X error during barrier: code=%d major=%d minor=%d badID=0x%08x",
-				connID, hdr[1], major, minor, badID)
+			log.Printf("client: synthRelay conn %d: X error during barrier: code=%d major=%d badID=0x%08x",
+				connID, hdr[1], hdr[10], badID)
 		}
 		if msgType == 1 {
-			log.Printf("client: synthRelay conn %d: barrier GetInputFocus reply received, entering drain mode", connID)
+			nSynth = order.Uint16(hdr[2:4])
 			break
 		}
 	}
 
-	// Phase 2 continued: drain forever — conn stays open, events discarded.
+	// Phase 3: forward all messages back to the server with rewritten sequence
+	// numbers. seqOffset maps synthesis-xconn seq space to app seq space so
+	// Xlib on the app side recognises replies to its own requests.
+	seqOffset := uint16(appSeqNum) - nSynth
 	for {
-		_, _, err := readMsg()
+		msgType, tail, err := readMsg()
 		if err != nil {
-			log.Printf("client: synthRelay conn %d: drain-forever read error: %v", connID, err)
 			return
 		}
+		if msgType == 0 {
+			badID := order.Uint32(hdr[4:8])
+			log.Printf("client: synthRelay conn %d: X error during live: code=%d major=%d badID=0x%08x",
+				connID, hdr[1], hdr[10], badID)
+		}
+		order.PutUint16(hdr[2:4], order.Uint16(hdr[2:4])+seqOffset)
+		var full []byte
+		if len(tail) > 0 {
+			full = make([]byte, 32+len(tail))
+			copy(full, hdr)
+			copy(full[32:], tail)
+		} else {
+			full = make([]byte, 32)
+			copy(full, hdr)
+		}
+		c.srvW.Lock()
+		wire.WriteX11Data(c.server, connID, full) //nolint:errcheck
+		c.srvW.Unlock()
 	}
 }
 

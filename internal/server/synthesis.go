@@ -9,15 +9,17 @@ import (
 )
 
 // sendX11Setup sends a MsgX11Setup message to the client carrying the
-// connection setup request bytes and the resource-id-base/mask from the
-// original real X server reply. The client uses these to establish a new
-// X connection with ID remapping.
-func (s *Server) sendX11Setup(connID uint32, setupReq []byte, ridBase, ridMask uint32) {
-	p := make([]byte, 4+4+4+len(setupReq))
+// connection setup request bytes, the resource-id-base/mask from the
+// original real X server reply, and the app's current sequence number.
+// The client uses these to establish a new X connection with ID remapping
+// and to rewrite sequence numbers on forwarded replies.
+func (s *Server) sendX11Setup(connID uint32, setupReq []byte, ridBase, ridMask, appSeqNum uint32) {
+	p := make([]byte, 4+4+4+4+len(setupReq))
 	binary.LittleEndian.PutUint32(p[0:4], connID)
 	binary.LittleEndian.PutUint32(p[4:8], ridBase)
 	binary.LittleEndian.PutUint32(p[8:12], ridMask)
-	copy(p[12:], setupReq)
+	binary.LittleEndian.PutUint32(p[12:16], appSeqNum)
+	copy(p[16:], setupReq)
 	s.WriteToClient(wire.MsgX11Setup, p) //nolint:errcheck
 }
 
@@ -30,7 +32,7 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		ridBase, ridMask := ac.RID()
 		log.Printf("server: synthesis conn %d: ridBase=0x%08x ridMask=0x%08x setupLen=%d",
 			ac.ID, ridBase, ridMask, len(setupReq))
-		s.sendX11Setup(ac.ID, setupReq, ridBase, ridMask)
+		s.sendX11Setup(ac.ID, setupReq, ridBase, ridMask, ac.SeqNum())
 	}
 
 	// 1. Windows: parent-first walk (no mapping yet).
@@ -173,8 +175,10 @@ func sanitizeCreateWindow(req []byte, order binary.ByteOrder) []byte {
 // the original drawable no longer exists (e.g., a pixmap that was freed before
 // reconnect). The GC's screen affinity comes from its drawable; substituting any
 // valid window on the same screen keeps the GC usable for drawing.
+// When substituting, GCTile (bit 10) is also stripped: a tile pixmap's depth
+// must match the drawable's depth, and we cannot guarantee that after substitution.
 func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Window, pixmaps map[uint32]x11.Pixmap, order binary.ByteOrder) []byte {
-	if len(req) < 12 || req[0] != x11.OpcodeCreateGC {
+	if len(req) < 16 || req[0] != x11.OpcodeCreateGC {
 		return req
 	}
 	if _, ok := windows[drawable]; ok {
@@ -184,13 +188,40 @@ func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Wind
 		return req
 	}
 	// Drawable is gone — substitute with the first available window.
+	var fallbackID uint32
 	for id := range windows {
-		out := make([]byte, len(req))
-		copy(out, req)
-		order.PutUint32(out[8:12], id)
+		fallbackID = id
+		break
+	}
+	if fallbackID == 0 {
+		return req // no windows either (shouldn't happen in practice)
+	}
+	out := make([]byte, len(req))
+	copy(out, req)
+	order.PutUint32(out[8:12], fallbackID)
+
+	// Strip GCTile (bit 10): tile depth must equal drawable depth, which we
+	// cannot guarantee after substituting an arbitrary window.
+	const gcTileBit = uint32(1 << 10)
+	valueMask := order.Uint32(out[12:16])
+	if valueMask&gcTileBit == 0 {
 		return out
 	}
-	return req // no windows either (shouldn't happen in practice)
+	tileOff := 16
+	for bit := uint(0); bit < 10; bit++ {
+		if valueMask&(1<<bit) != 0 {
+			tileOff += 4
+		}
+	}
+	if len(out) < tileOff+4 {
+		return out
+	}
+	result := make([]byte, len(out)-4)
+	copy(result, out[:tileOff])
+	copy(result[tileOff:], out[tileOff+4:])
+	order.PutUint32(result[12:16], valueMask&^gcTileBit)
+	order.PutUint16(result[2:4], uint16(len(result)/4))
+	return result
 }
 
 func findRoots(windows map[uint32]x11.Window) []uint32 {

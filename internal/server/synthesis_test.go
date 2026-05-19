@@ -120,3 +120,43 @@ func TestSanitizeGCDrawable_MissingDrawable(t *testing.T) {
 		t.Errorf("substituted drawable: got 0x%08x, want 0x02200003", gotDrawable)
 	}
 }
+
+func TestSanitizeGCDrawable_StripsGCTile(t *testing.T) {
+	// CreateGC with value-mask = GCForeground|GCBackground|GCTile (bits 4,5,10).
+	// value-list: Foreground=0xff, Background=0x00, Tile=0x02200012 (freed pixmap).
+	// 3 values × 4 bytes = 12 bytes; total = 16 + 12 = 28 bytes.
+	req := make([]byte, 28)
+	req[0] = x11.OpcodeCreateGC
+	binary.LittleEndian.PutUint16(req[2:], 7)           // length = 28/4 = 7 units
+	binary.LittleEndian.PutUint32(req[4:], 0x0220000f)  // gc id
+	binary.LittleEndian.PutUint32(req[8:], 0x0220000d)  // drawable = freed pixmap
+	binary.LittleEndian.PutUint32(req[12:], (1<<4)|(1<<5)|(1<<10)) // value-mask
+	binary.LittleEndian.PutUint32(req[16:], 0xff)       // GCForeground
+	binary.LittleEndian.PutUint32(req[20:], 0x00)       // GCBackground
+	binary.LittleEndian.PutUint32(req[24:], 0x02200012) // GCTile (freed)
+
+	windows := map[uint32]x11.Window{0x02200003: {ID: 0x02200003}}
+	pixmaps := map[uint32]x11.Pixmap{}
+
+	out := sanitizeGCDrawable(req, 0x0220000d, windows, pixmaps, binary.LittleEndian)
+
+	if len(out) != 24 {
+		t.Fatalf("expected len=24 (tile stripped), got %d", len(out))
+	}
+	// GCTile bit cleared.
+	gotMask := binary.LittleEndian.Uint32(out[12:])
+	if gotMask&(1<<10) != 0 {
+		t.Errorf("GCTile still set in value-mask: 0x%x", gotMask)
+	}
+	// GCForeground and GCBackground preserved.
+	if binary.LittleEndian.Uint32(out[16:]) != 0xff {
+		t.Errorf("GCForeground corrupted")
+	}
+	if binary.LittleEndian.Uint32(out[20:]) != 0x00 {
+		t.Errorf("GCBackground corrupted")
+	}
+	// Length field updated.
+	if gotLen := binary.LittleEndian.Uint16(out[2:]); gotLen != 6 {
+		t.Errorf("length field: got %d, want 6", gotLen)
+	}
+}

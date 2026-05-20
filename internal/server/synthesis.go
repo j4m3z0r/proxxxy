@@ -66,12 +66,22 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		}
 	}
 
+	// 2.5. Fonts: open before GCs so GCs that reference a font ID don't fail with BadFont.
+	fonts := ac.Fonts()
+	for _, f := range fonts {
+		if or := f.OpenReq(); len(or) > 0 {
+			log.Printf("server: synthesis conn %d: OpenFont 0x%08x %q", ac.ID, f.ID, f.Name)
+			s.sendToClient(ac.ID, or)
+		}
+	}
+
 	// 3. GCs: create + replay all attribute changes.
 	// Must come before pixmap draw commands since draws reference GC IDs.
 	gcs := ac.GCs()
 	for _, gc := range gcs {
 		if cr := gc.CreateReq(); len(cr) > 0 {
 			cr = sanitizeGCDrawable(cr, gc.Drawable, windows, pixmaps, ac.Order)
+			cr = sanitizeGCFont(cr, fonts, ac.Order)
 			log.Printf("server: synthesis conn %d: CreateGC 0x%08x drawable=0x%08x len=%d",
 				ac.ID, gc.ID, gc.Drawable, len(cr))
 			s.sendToClient(ac.ID, cr)
@@ -275,6 +285,42 @@ func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Wind
 	order.PutUint32(result[12:16], valueMask&^gcTileBit)
 	order.PutUint16(result[2:4], uint16(len(result)/4))
 	return result
+}
+
+// sanitizeGCFont strips GCFont (bit 14) from a CreateGC request if the
+// referenced font is not in the tracked font set. Without this, CreateGC fails
+// with BadFont when a font was closed before reconnect, which then causes
+// BadGC for every subsequent draw command using that GC.
+func sanitizeGCFont(req []byte, fonts map[uint32]x11.Font, order binary.ByteOrder) []byte {
+	if len(req) < 16 || req[0] != x11.OpcodeCreateGC {
+		return req
+	}
+	const gcFontBit = uint32(1 << 14)
+	valueMask := order.Uint32(req[12:16])
+	if valueMask&gcFontBit == 0 {
+		return req // no GCFont — nothing to strip
+	}
+	// Locate GCFont in the value-list (values ordered by bit position).
+	fontOff := 16
+	for bit := uint(0); bit < 14; bit++ {
+		if valueMask&(1<<bit) != 0 {
+			fontOff += 4
+		}
+	}
+	if len(req) < fontOff+4 {
+		return req
+	}
+	fontID := order.Uint32(req[fontOff:])
+	if _, ok := fonts[fontID]; ok {
+		return req // font is open — keep GCFont as-is
+	}
+	// Font not tracked: strip the GCFont 4-byte value from the list.
+	out := make([]byte, len(req)-4)
+	copy(out, req[:fontOff])
+	copy(out[fontOff:], req[fontOff+4:])
+	order.PutUint32(out[12:16], valueMask&^gcFontBit)
+	order.PutUint16(out[2:4], uint16(len(out)/4))
+	return out
 }
 
 func findRoots(windows map[uint32]x11.Window) []uint32 {

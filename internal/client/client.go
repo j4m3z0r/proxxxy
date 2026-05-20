@@ -67,8 +67,37 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 	case x11.OpcodeCreateGC:
 		remap(4) // GC ID
 		remap(8) // drawable
-	case x11.OpcodeChangeGC, x11.OpcodeFreeGC:
-		remap(4) // GC ID ([8:12] is value-mask, not a resource ID)
+		// Remap GCFont (bit 14) in the value-list if present.
+		// Font IDs are allocated from the app's ridBase/ridMask space.
+		if len(out) >= 16 {
+			valueMask := r.order.Uint32(out[12:16])
+			if valueMask&(1<<14) != 0 {
+				fontOff := 16
+				for bit := uint(0); bit < 14; bit++ {
+					if valueMask&(1<<bit) != 0 {
+						fontOff += 4
+					}
+				}
+				remap(fontOff)
+			}
+		}
+	case x11.OpcodeChangeGC:
+		remap(4) // GC ID
+		// Remap GCFont (bit 14) in the value-list if present.
+		if len(out) >= 12 {
+			valueMask := r.order.Uint32(out[8:12])
+			if valueMask&(1<<14) != 0 {
+				fontOff := 12
+				for bit := uint(0); bit < 14; bit++ {
+					if valueMask&(1<<bit) != 0 {
+						fontOff += 4
+					}
+				}
+				remap(fontOff)
+			}
+		}
+	case x11.OpcodeFreeGC:
+		remap(4)
 	case x11.OpcodeCopyGC:
 		remap(4) // src GC
 		remap(8) // dst GC

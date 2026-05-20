@@ -41,9 +41,13 @@ type Pixmap struct {
 
 // Font represents an open X11 font.
 type Font struct {
-	ID   uint32
-	Name string
+	ID      uint32
+	Name    string
+	openReq []byte
 }
+
+// OpenReq returns the raw X11 OpenFont request bytes.
+func (f Font) OpenReq() []byte { return f.openReq }
 
 // Picture represents a RENDER extension Picture resource.
 type Picture struct {
@@ -319,7 +323,9 @@ func (a *AppConn) handleOpenFont(req []byte) {
 	if len(req) >= 12+nameLen {
 		name = string(req[12 : 12+nameLen])
 	}
-	a.fonts[fid] = &Font{ID: fid, Name: name}
+	cp := make([]byte, len(req))
+	copy(cp, req)
+	a.fonts[fid] = &Font{ID: fid, Name: name, openReq: cp}
 }
 
 func (a *AppConn) handleCloseFont(req []byte) {
@@ -397,6 +403,17 @@ func (a *AppConn) Pixmaps() map[uint32]Pixmap {
 		p := *v                                          // copy struct
 		p.DrawCmds = append([][]byte(nil), v.DrawCmds...) // deep copy slice of slices
 		out[k] = p
+	}
+	return out
+}
+
+// Fonts returns a snapshot of all currently open fonts.
+func (a *AppConn) Fonts() map[uint32]Font {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32]Font, len(a.fonts))
+	for k, v := range a.fonts {
+		out[k] = *v
 	}
 	return out
 }

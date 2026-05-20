@@ -31,6 +31,7 @@ internal/server/  Server struct, session parsing, Phase 2 synthesis
 internal/client/  Client struct, local display relay
 internal/x11/     opcode constants, request header parser, X11 state model, remap tables
 internal/compress/ Dict, TemplateRegistry, RegionTracker, Encoder
+cmd/xlog/          debug tool: sniffs X11 traffic on a display and logs opcodes/extensions
 docs/superpowers/specs/  design doc
 docs/superpowers/plans/  original 17-task implementation plan
 ```
@@ -97,8 +98,9 @@ The encoder (`compress.Encoder`) is fully implemented and tested but **not wired
 ## Other Known Gaps
 
 - **`cmd/ctl`** stats CLI dials `localhost:7101` and expects JSON, but the server has no stats endpoint. Stub only.
-- **Font state** not tracked in `AppConn` — fonts opened before reconnect won't be re-opened during synthesis.
+- **Font state** not tracked in `AppConn` — fonts opened before reconnect won't be re-opened during synthesis. A GC that references a font causes BadFont during synthesis CreateGC. The GC is not created, its DrawCmds are skipped by the synthesis filter, and the app redraws via Expose. Non-fatal but noisy.
 - **No tests** for `internal/client`.
+- **DrawCmds may reference freed GCs** — synthesis replays pixmap draw history which may include commands sent with GCs that were later freed. The synthesis now skips such commands (GC liveness filter in step 5), but pixmap content may be slightly incomplete until the Expose-triggered redraw.
 
 ## Test Suite
 

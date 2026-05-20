@@ -103,6 +103,8 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		case x11.RenderTrapezoids, x11.RenderTriangles, x11.RenderTriStrip, x11.RenderTriFan:
 			remap(8)  // src picture
 			remap(12) // dst picture
+		case x11.RenderSetPictureClipRectangles:
+			remap(4) // pic
 		case x11.RenderSetPictureTransform:
 			remap(4) // pic
 		case x11.RenderSetPictureFilter:
@@ -110,6 +112,27 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		case x11.RenderCreateSolidFill, x11.RenderCreateLinearGradient,
 			x11.RenderCreateRadialGradient, x11.RenderCreateConicalGradient:
 			remap(4) // pid only; no drawable
+		// GlyphSet IDs are allocated from the app's ridBase/ridMask space and
+		// need remapping when oldBase != newBase, just like other resource IDs.
+		case x11.RenderCreateGlyphSet:
+			remap(4) // gsid
+		case x11.RenderReferenceGlyphSet:
+			remap(4) // new gsid
+			remap(8) // existing gsid
+		case x11.RenderFreeGlyphSet:
+			remap(4) // gsid
+		case x11.RenderAddGlyphs:
+			remap(4) // gsid (glyph IDs within the set are CARD32 indices, not X resource IDs)
+		// CompositeGlyphs wire layout (RENDER protocol):
+		// [major:1][minor:1][len:2][op:1][pad:3][src:4][dst:4][mask-format:4][glyphset:4]...
+		// src, dst, and glyphset are all in the app's resource-id space.
+		case x11.RenderCompositeGlyphs8, x11.RenderCompositeGlyphs16, x11.RenderCompositeGlyphs32:
+			remap(8)  // src picture
+			remap(12) // dst picture
+			remap(20) // glyphset
+		// FillRectangles: [op:1][pad:3][dst:4][color:8][rects…]
+		case x11.RenderFillRectangles:
+			remap(8) // dst picture
 		}
 	default:
 		// Draw commands and anything else: drawable at [4], GC at [8].
@@ -264,6 +287,13 @@ func (c *Client) handleX11Setup(payload []byte) {
 	}
 
 	c.mu.Lock()
+	// Close any existing xconn for this connID so its synthRelay goroutine
+	// exits promptly. Without this, the old goroutine keeps forwarding events
+	// with stale sequence offsets onto the new connection, corrupting Xlib's
+	// sequence tracking and causing "Unknown sequence number" assertion failures.
+	if old, ok := c.xConns[connID]; ok {
+		old.Close()
+	}
 	c.xConns[connID] = xconn
 	if oldBase != 0 && newBase != 0 && oldBase != newBase {
 		log.Printf("client: synthesis conn %d: oldBase=0x%08x mask=0x%08x newBase=0x%08x",
@@ -272,6 +302,7 @@ func (c *Client) handleX11Setup(payload []byte) {
 	} else {
 		log.Printf("client: synthesis conn %d: oldBase=0x%08x newBase=0x%08x (no remap needed)",
 			connID, oldBase, newBase)
+		delete(c.idRemaps, connID)
 	}
 	// synthRelay runs immediately in drain mode, discarding synthesis-phase
 	// events/errors whose sequence numbers would confuse the app's Xlib. Once
@@ -417,50 +448,68 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 	defer func() {
 		xconn.Close()
 		c.mu.Lock()
-		delete(c.xConns, connID)
-		delete(c.idRemaps, connID)
+		// Only remove this connID if it still points to our xconn. On a second
+		// reconnect, handleX11Setup may have already replaced xConns[connID] with
+		// a new xconn; deleting it here would evict the new connection.
+		if c.xConns[connID] == xconn {
+			delete(c.xConns, connID)
+			delete(c.idRemaps, connID)
+		}
 		c.mu.Unlock()
 	}()
 
-	hdr := make([]byte, 32)
-	// readMsg reads one X11 message from xconn into hdr and returns any
-	// variable-length tail (replies and GenericEvents only).
-	readMsg := func() (msgType byte, tail []byte, err error) {
-		if _, err = io.ReadFull(xconn, hdr); err != nil {
-			return
-		}
-		msgType = hdr[0]
-		if msgType == 1 || msgType == 35 { // reply or GenericEvent
-			n := int(order.Uint32(hdr[4:8])) * 4
-			if n > 0 {
-				tail = make([]byte, n)
-				_, err = io.ReadFull(xconn, tail)
-			}
-		}
-		return
+	type synthMsg struct {
+		hdr  [32]byte
+		tail []byte
+		err  error
 	}
+	msgs := make(chan synthMsg, 16)
+	go func() {
+		var h [32]byte
+		for {
+			if _, err := io.ReadFull(xconn, h[:]); err != nil {
+				msgs <- synthMsg{err: err}
+				return
+			}
+			var tail []byte
+			if h[0] == 1 || h[0] == 35 { // reply or GenericEvent has variable tail
+				n := int(order.Uint32(h[4:8])) * 4
+				if n > 0 {
+					tail = make([]byte, n)
+					if _, err := io.ReadFull(xconn, tail); err != nil {
+						msgs <- synthMsg{err: err}
+						return
+					}
+				}
+			}
+			cp := synthMsg{tail: tail}
+			copy(cp.hdr[:], h[:])
+			msgs <- cp
+		}
+	}()
 
-	// Phase 1: drain until SESSION_LIVE.
+	// Phase 1: drain until SESSION_LIVE fires. Uses select so we don't block
+	// on readMsg — SESSION_LIVE may arrive between X messages.
 	for {
-		msgType, _, err := readMsg()
-		if err != nil {
-			return
-		}
-		if msgType == 0 {
-			badID := order.Uint32(hdr[4:8])
-			minor := order.Uint16(hdr[8:10])
-			major := hdr[10]
-			log.Printf("client: synthRelay conn %d: X error during synthesis: code=%d major=%d minor=%d badID=0x%08x",
-				connID, hdr[1], major, minor, badID)
-		}
 		select {
 		case <-done:
-			// SESSION_LIVE received — move to barrier phase.
-		default:
-			continue
+			done = nil // nil channel blocks forever; disables this arm
+		case m := <-msgs:
+			if m.err != nil {
+				return
+			}
+			if m.hdr[0] == 0 {
+				badID := order.Uint32(m.hdr[4:8])
+				minor := order.Uint16(m.hdr[8:10])
+				log.Printf("client: synthRelay conn %d: X error during synthesis: code=%d major=%d minor=%d badID=0x%08x",
+					connID, m.hdr[1], m.hdr[10], minor, badID)
+			}
+			if done == nil {
+				goto phase2
+			}
 		}
-		break
 	}
+phase2:
 
 	// Phase 2: barrier. Send GetInputFocus so the X server processes it after
 	// all synthesis commands. Drain until we receive its reply, capturing the
@@ -473,17 +522,17 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 	}
 	var nSynth uint16
 	for {
-		msgType, _, err := readMsg()
-		if err != nil {
+		m := <-msgs
+		if m.err != nil {
 			return
 		}
-		if msgType == 0 {
-			badID := order.Uint32(hdr[4:8])
+		if m.hdr[0] == 0 {
+			badID := order.Uint32(m.hdr[4:8])
 			log.Printf("client: synthRelay conn %d: X error during barrier: code=%d major=%d badID=0x%08x",
-				connID, hdr[1], hdr[10], badID)
+				connID, m.hdr[1], m.hdr[10], badID)
 		}
-		if msgType == 1 {
-			nSynth = order.Uint16(hdr[2:4])
+		if m.hdr[0] == 1 {
+			nSynth = order.Uint16(m.hdr[2:4])
 			break
 		}
 	}
@@ -493,24 +542,25 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 	// Xlib on the app side recognises replies to its own requests.
 	seqOffset := uint16(appSeqNum) - nSynth
 	for {
-		msgType, tail, err := readMsg()
-		if err != nil {
+		m := <-msgs
+		if m.err != nil {
 			return
 		}
-		if msgType == 0 {
-			badID := order.Uint32(hdr[4:8])
-			log.Printf("client: synthRelay conn %d: X error during live: code=%d major=%d badID=0x%08x",
-				connID, hdr[1], hdr[10], badID)
+		if m.hdr[0] == 0 {
+			badID := order.Uint32(m.hdr[4:8])
+			minor := order.Uint16(m.hdr[8:10])
+			log.Printf("client: synthRelay conn %d: X error during live: code=%d major=%d minor=%d badID=0x%08x",
+				connID, m.hdr[1], m.hdr[10], minor, badID)
 		}
-		order.PutUint16(hdr[2:4], order.Uint16(hdr[2:4])+seqOffset)
+		h := m.hdr
+		order.PutUint16(h[2:4], order.Uint16(h[2:4])+seqOffset)
 		var full []byte
-		if len(tail) > 0 {
-			full = make([]byte, 32+len(tail))
-			copy(full, hdr)
-			copy(full[32:], tail)
+		if len(m.tail) > 0 {
+			full = make([]byte, 32+len(m.tail))
+			copy(full, h[:])
+			copy(full[32:], m.tail)
 		} else {
-			full = make([]byte, 32)
-			copy(full, hdr)
+			full = h[:]
 		}
 		c.srvW.Lock()
 		wire.WriteX11Data(c.server, connID, full) //nolint:errcheck

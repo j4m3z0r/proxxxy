@@ -56,32 +56,47 @@ type Picture struct {
 // CreateReq returns the raw RenderCreatePicture request bytes.
 func (p Picture) CreateReq() []byte { return p.createReq }
 
+// GlyphSet represents a RENDER extension GlyphSet resource.
+// GlyphSets use IDs from the app's resource-id space but their lifetime is
+// independent of the creating connection; however, they are freed when the
+// last referencing connection closes. Synthesis must recreate them.
+type GlyphSet struct {
+	ID            uint32
+	createReq     []byte   // raw RenderCreateGlyphSet or RenderReferenceGlyphSet request
+	AddGlyphsCmds [][]byte // replay log of RenderAddGlyphs requests
+}
+
+// CreateReq returns the raw RenderCreateGlyphSet (or ReferenceGlyphSet) request bytes.
+func (g GlyphSet) CreateReq() []byte { return g.createReq }
+
 // AppConn is the per-application-connection state maintained by the server.
 type AppConn struct {
 	ID    uint32
 	Order ByteOrder
 
-	mu       sync.RWMutex
-	windows  map[uint32]*Window
-	gcs      map[uint32]*GC
-	pixmaps  map[uint32]*Pixmap
-	fonts    map[uint32]*Font
-	seqNum   uint32
-	setupReq []byte // X11 connection setup request from app
-	ridBase  uint32 // resource-id-base from real X server setup reply
-	pictures map[uint32]*Picture
-	ridMask  uint32 // resource-id-mask from real X server setup reply
+	mu         sync.RWMutex
+	windows    map[uint32]*Window
+	gcs        map[uint32]*GC
+	pixmaps    map[uint32]*Pixmap
+	fonts      map[uint32]*Font
+	seqNum     uint32
+	setupReq   []byte // X11 connection setup request from app
+	ridBase    uint32 // resource-id-base from real X server setup reply
+	pictures   map[uint32]*Picture
+	glyphSets  map[uint32]*GlyphSet
+	ridMask    uint32 // resource-id-mask from real X server setup reply
 }
 
 func NewAppConn(id uint32, order ByteOrder) *AppConn {
 	return &AppConn{
-		ID:       id,
-		Order:    order,
-		windows:  make(map[uint32]*Window),
-		gcs:      make(map[uint32]*GC),
-		pixmaps:  make(map[uint32]*Pixmap),
-		fonts:    make(map[uint32]*Font),
-		pictures: make(map[uint32]*Picture),
+		ID:        id,
+		Order:     order,
+		windows:   make(map[uint32]*Window),
+		gcs:       make(map[uint32]*GC),
+		pixmaps:   make(map[uint32]*Pixmap),
+		fonts:     make(map[uint32]*Font),
+		pictures:  make(map[uint32]*Picture),
+		glyphSets: make(map[uint32]*GlyphSet),
 	}
 }
 
@@ -468,6 +483,41 @@ func (a *AppConn) handleRender(req []byte) {
 	case RenderFreePicture:
 		// Layout: [139:1][7:1][len:2][pid:4]
 		delete(a.pictures, a.Order.Uint32(req[4:8]))
+	case RenderCreateGlyphSet:
+		// Layout: [139:1][16:1][len:2][gsid:4][format:4]
+		if len(req) < 12 {
+			return
+		}
+		gsid := a.Order.Uint32(req[4:8])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.glyphSets[gsid] = &GlyphSet{ID: gsid, createReq: cp}
+	case RenderReferenceGlyphSet:
+		// Layout: [139:1][17:1][len:2][gsid_new:4][gsid_existing:4]
+		if len(req) < 12 {
+			return
+		}
+		gsid := a.Order.Uint32(req[4:8])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.glyphSets[gsid] = &GlyphSet{ID: gsid, createReq: cp}
+	case RenderFreeGlyphSet:
+		// Layout: [139:1][18:1][len:2][gsid:4]
+		if len(req) < 8 {
+			return
+		}
+		delete(a.glyphSets, a.Order.Uint32(req[4:8]))
+	case RenderAddGlyphs:
+		// Layout: [139:1][20:1][len:2][gsid:4][nglyphs:4][gids:4*n][infos:12*n][image_data...]
+		if len(req) < 12 {
+			return
+		}
+		gsid := a.Order.Uint32(req[4:8])
+		if gs, ok := a.glyphSets[gsid]; ok {
+			cp := make([]byte, len(req))
+			copy(cp, req)
+			gs.AddGlyphsCmds = append(gs.AddGlyphsCmds, cp)
+		}
 	}
 }
 
@@ -485,6 +535,24 @@ func (a *AppConn) Pictures() map[uint32]Picture {
 			p.ChangeCmds = append(p.ChangeCmds, append([]byte(nil), cmd...))
 		}
 		out[k] = p
+	}
+	return out
+}
+
+// GlyphSets returns a snapshot of all tracked RENDER GlyphSets.
+func (a *AppConn) GlyphSets() map[uint32]GlyphSet {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32]GlyphSet, len(a.glyphSets))
+	for k, v := range a.glyphSets {
+		gs := GlyphSet{ID: v.ID}
+		if len(v.createReq) > 0 {
+			gs.createReq = append([]byte(nil), v.createReq...)
+		}
+		for _, cmd := range v.AddGlyphsCmds {
+			gs.AddGlyphsCmds = append(gs.AddGlyphsCmds, append([]byte(nil), cmd...))
+		}
+		out[k] = gs
 	}
 	return out
 }

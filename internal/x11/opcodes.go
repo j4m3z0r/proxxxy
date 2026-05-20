@@ -83,20 +83,29 @@ const (
 // objects so that synthesis can recreate them after reconnect.
 const OpcodeRender = 139
 
-// RENDER extension minor opcodes relevant to resource tracking.
+// RENDER extension minor opcodes (renderproto.h, RENDER protocol v0.11+).
 const (
-	RenderCreatePicture       = 4
-	RenderChangePicture       = 5
-	RenderFreePicture         = 7
-	RenderComposite           = 8
-	RenderTrapezoids          = 10
-	RenderTriangles           = 11
-	RenderTriStrip            = 12
-	RenderTriFan              = 13
-	RenderSetPictureTransform = 28
-	RenderSetPictureFilter    = 30
-	// Extended picture constructors (RENDER protocol v0.7+).
-	// These create Picture resources without a backing drawable.
+	RenderCreatePicture             = 4
+	RenderChangePicture             = 5
+	RenderSetPictureClipRectangles  = 6
+	RenderFreePicture               = 7
+	RenderComposite                 = 8
+	RenderTrapezoids                = 10
+	RenderTriangles                 = 11
+	RenderTriStrip                  = 12
+	RenderTriFan                    = 13
+	RenderCreateGlyphSet            = 16
+	RenderReferenceGlyphSet         = 17
+	RenderFreeGlyphSet              = 18
+	RenderAddGlyphs                 = 20
+	RenderFreeGlyphs                = 22
+	RenderCompositeGlyphs8          = 23
+	RenderCompositeGlyphs16         = 24
+	RenderCompositeGlyphs32         = 25
+	RenderFillRectangles            = 26
+	RenderSetPictureTransform       = 28
+	RenderSetPictureFilter          = 30
+	// Picture constructors without a backing drawable (RENDER protocol v0.7+).
 	RenderCreateSolidFill       = 33
 	RenderCreateLinearGradient  = 34
 	RenderCreateRadialGradient  = 35

@@ -68,7 +68,8 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 
 	// 3. GCs: create + replay all attribute changes.
 	// Must come before pixmap draw commands since draws reference GC IDs.
-	for _, gc := range ac.GCs() {
+	gcs := ac.GCs()
+	for _, gc := range gcs {
 		if cr := gc.CreateReq(); len(cr) > 0 {
 			cr = sanitizeGCDrawable(cr, gc.Drawable, windows, pixmaps, ac.Order)
 			log.Printf("server: synthesis conn %d: CreateGC 0x%08x drawable=0x%08x len=%d",
@@ -93,9 +94,34 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		}
 	}
 
+	// 4b. RENDER GlyphSets: recreate and repopulate before any CompositeGlyphs
+	//     calls can arrive via Expose-triggered redraws. GlyphSets use IDs from
+	//     the app's resource-id space but are freed when the last referencing
+	//     connection closes (i.e. when the client disconnects).
+	for _, gs := range ac.GlyphSets() {
+		if cr := gs.CreateReq(); len(cr) > 0 {
+			log.Printf("server: synthesis conn %d: CreateGlyphSet 0x%08x len=%d addCmds=%d",
+				ac.ID, gs.ID, len(cr), len(gs.AddGlyphsCmds))
+			s.sendToClient(ac.ID, cr)
+			for _, cmd := range gs.AddGlyphsCmds {
+				s.sendToClient(ac.ID, cmd)
+			}
+		}
+	}
+
 	// 5. Pixmap draw commands: replay after GCs and Pictures exist.
+	// Skip commands that reference a GC that was freed before this reconnect —
+	// those GCs are gone from the synthesis xconn and would cause BadGC errors.
+	// ClearArea (opcode 61) has no GC field; all other tracked draw opcodes
+	// carry the GC at bytes [8:12].
 	for _, pm := range pixmaps {
 		for _, cmd := range pm.DrawCmds {
+			if len(cmd) >= 12 && cmd[0] != x11.OpcodeClearArea {
+				gcID := ac.Order.Uint32(cmd[8:12])
+				if _, ok := gcs[gcID]; !ok {
+					continue
+				}
+			}
 			s.sendToClient(ac.ID, cmd)
 		}
 	}
@@ -306,6 +332,12 @@ func (s *Server) runSynthesis() {
 	// redraw responses reach the client after it has entered live-relay mode,
 	// so replies from the synthesis X connection are forwarded (not drained).
 	s.WriteToClient(wire.MsgSessionLive, nil)
+
+	// Clear live-relay block BEFORE injecting Expose. Draw commands triggered by
+	// the app's Expose handler must not be discarded by sendMsgsToClient.
+	s.mu.Lock()
+	s.synthActive = false
+	s.mu.Unlock()
 
 	for _, ac := range states {
 		s.synthesisExpose(ac)

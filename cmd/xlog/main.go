@@ -37,14 +37,17 @@ var (
 )
 
 type entry struct {
-	T    float64 `json:"t"`
-	Dir  string  `json:"dir"`
-	Type string  `json:"type,omitempty"`
-	Op   int     `json:"op,omitempty"`
-	Name string  `json:"name,omitempty"`
-	Len  int     `json:"len,omitempty"`
-	Seq  int     `json:"seq,omitempty"`
-	Code int     `json:"code,omitempty"`
+	T     float64 `json:"t"`
+	Dir   string  `json:"dir"`
+	Type  string  `json:"type,omitempty"`
+	Op    int     `json:"op,omitempty"`
+	Minor int     `json:"minor,omitempty"`
+	Name  string  `json:"name,omitempty"`
+	Len   int     `json:"len,omitempty"`
+	Seq   int     `json:"seq,omitempty"`
+	Code  int     `json:"code,omitempty"`
+	// Bytes holds the first 16 bytes of the request body as hex, for extension requests.
+	Bytes string `json:"bytes,omitempty"`
 }
 
 func emit(e entry) {
@@ -342,7 +345,20 @@ func handleConn(client net.Conn, backendSocket string, deadline time.Time) {
 				return
 			}
 		}
-		emit(entry{Dir: "C2S", Op: int(h.Opcode), Name: opName(h.Opcode), Len: int(h.ByteLen)})
+		e := entry{Dir: "C2S", Op: int(h.Opcode), Name: opName(h.Opcode), Len: int(h.ByteLen)}
+		if h.Opcode >= 128 {
+			// rhdr[1] is the minor opcode for extension requests.
+			e.Minor = int(rhdr[1])
+			// Capture first 16 bytes of request body for resource ID inspection.
+			n := len(body)
+			if n > 16 {
+				n = 16
+			}
+			if n > 0 {
+				e.Bytes = fmt.Sprintf("%x", body[:n])
+			}
+		}
+		emit(e)
 		full := make([]byte, h.ByteLen)
 		copy(full, rhdr[:])
 		copy(full[4:], body)

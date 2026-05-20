@@ -240,9 +240,19 @@ func (s *Server) handleClient(conn net.Conn) {
 	// synthesis can write to the client, but synthActive=true makes
 	// sendMsgsToClient discard live traffic until synthesis is complete.
 	s.mu.Lock()
+	prev := s.clientConn
 	s.clientConn = conn
 	s.synthActive = true
 	s.mu.Unlock()
+
+	// Disconnect the previous client before synthesis begins. When it receives
+	// a TCP close, its readFromClient loop exits and its relay goroutines drain.
+	// Without this, the old client's synthRelay goroutines keep forwarding X
+	// server events with stale sequence offsets, corrupting Xlib's seq counter.
+	if prev != nil {
+		prev.Close()
+	}
+
 	defer func() {
 		s.mu.Lock()
 		if s.clientConn == conn {
@@ -258,11 +268,8 @@ func (s *Server) handleClient(conn net.Conn) {
 	}()
 
 	// Phase 2: synthesise existing X11 state for the reconnecting client.
+	// synthActive is cleared inside runSynthesis before Expose injection.
 	s.runSynthesis()
-
-	s.mu.Lock()
-	s.synthActive = false
-	s.mu.Unlock()
 
 	// Unblock apps that connected before this client arrived and are still
 	// waiting for their X11 setup reply.

@@ -76,7 +76,10 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	}
 
 	// 2.6. Cursors: create after pixmaps and fonts (CreateCursor uses pixmaps;
-	// CreateGlyphCursor uses fonts). Skip cursors whose source resource is gone.
+	// CreateGlyphCursor uses fonts). For CreateGlyphCursor, if the source font was
+	// closed after the cursor was created, reopen it temporarily so CreateGlyphCursor
+	// succeeds, then close it again — the cursor resource remains valid after the font
+	// closes, just as it did in the original session.
 	for _, cur := range ac.Cursors() {
 		cr := cur.CreateReq()
 		if len(cr) < 16 {
@@ -93,8 +96,21 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		case x11.OpcodeCreateGlyphCursor:
 			srcFont := ac.Order.Uint32(cr[8:12])
 			if _, ok := fonts[srcFont]; !ok {
-				log.Printf("server: synthesis conn %d: skip CreateGlyphCursor 0x%08x (source font 0x%08x gone)",
-					ac.ID, cur.ID, srcFont)
+				fontName := cur.SrcFontName()
+				if fontName == "" {
+					log.Printf("server: synthesis conn %d: skip CreateGlyphCursor 0x%08x (font 0x%08x gone, name unknown)",
+						ac.ID, cur.ID, srcFont)
+					continue
+				}
+				// Font was closed after cursor creation. Reopen it with the same
+				// ID so CreateGlyphCursor succeeds, then close it — the cursor
+				// outlives the font, matching original session behaviour.
+				log.Printf("server: synthesis conn %d: reopen font %q (0x%08x) for cursor 0x%08x",
+					ac.ID, fontName, srcFont, cur.ID)
+				s.sendToClient(ac.ID, makeOpenFont(srcFont, fontName, ac.Order))
+				log.Printf("server: synthesis conn %d: CreateGlyphCursor 0x%08x", ac.ID, cur.ID)
+				s.sendToClient(ac.ID, cr)
+				s.sendToClient(ac.ID, makeCloseFont(srcFont, ac.Order))
 				continue
 			}
 		}
@@ -108,6 +124,7 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	for _, gc := range gcs {
 		if cr := gc.CreateReq(); len(cr) > 0 {
 			cr = sanitizeGCDrawable(cr, gc.Drawable, windows, pixmaps, ac.Order)
+			cr = sanitizeGCPixmapAttrs(cr, pixmaps, ac.Order)
 			cr = sanitizeGCFont(cr, fonts, ac.Order)
 			log.Printf("server: synthesis conn %d: CreateGC 0x%08x drawable=0x%08x len=%d",
 				ac.ID, gc.ID, gc.Drawable, len(cr))
@@ -323,6 +340,67 @@ func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Wind
 	return result
 }
 
+// sanitizeGCPixmapAttrs strips GCTile (bit 10) and GCStipple (bit 11) from a
+// CreateGC request when the referenced pixmap is not in the tracked set. Freed
+// pixmaps would cause BadPixmap on the synthesis X connection.
+func sanitizeGCPixmapAttrs(req []byte, pixmaps map[uint32]x11.Pixmap, order binary.ByteOrder) []byte {
+	if len(req) < 16 || req[0] != x11.OpcodeCreateGC {
+		return req
+	}
+	for _, bit := range [2]uint{10, 11} { // GCTile, GCStipple
+		if len(req) < 16 {
+			break
+		}
+		valueMask := order.Uint32(req[12:16])
+		if valueMask&(1<<bit) == 0 {
+			continue
+		}
+		off := 16
+		for b := uint(0); b < bit; b++ {
+			if valueMask&(1<<b) != 0 {
+				off += 4
+			}
+		}
+		if len(req) < off+4 {
+			continue
+		}
+		pmID := order.Uint32(req[off:])
+		if _, ok := pixmaps[pmID]; ok {
+			continue
+		}
+		log.Printf("server: synthesis: strip GC bit %d (pixmap 0x%08x gone)", bit, pmID)
+		req = stripGCAttr(req, bit, order)
+	}
+	return req
+}
+
+// stripGCAttr removes the value for a single value-list attribute bit from a
+// CreateGC request and clears that bit in the value mask.
+func stripGCAttr(req []byte, bit uint, order binary.ByteOrder) []byte {
+	if len(req) < 16 {
+		return req
+	}
+	valueMask := order.Uint32(req[12:16])
+	if valueMask&(1<<bit) == 0 {
+		return req
+	}
+	off := 16
+	for b := uint(0); b < bit; b++ {
+		if valueMask&(1<<b) != 0 {
+			off += 4
+		}
+	}
+	if len(req) < off+4 {
+		return req
+	}
+	out := make([]byte, len(req)-4)
+	copy(out, req[:off])
+	copy(out[off:], req[off+4:])
+	order.PutUint32(out[12:16], valueMask&^(1<<bit))
+	order.PutUint16(out[2:4], uint16(len(out)/4))
+	return out
+}
+
 // sanitizeGCFont strips GCFont (bit 14) from a CreateGC request if the
 // referenced font is not in the tracked font set. Without this, CreateGC fails
 // with BadFont when a font was closed before reconnect, which then causes
@@ -377,6 +455,29 @@ func makeMapWindow(wid uint32, order binary.ByteOrder) []byte {
 	return req
 }
 
+// makeOpenFont builds a raw X11 OpenFont request for the given font ID and name.
+func makeOpenFont(fid uint32, name string, order binary.ByteOrder) []byte {
+	nameLen := len(name)
+	padLen := (4 - nameLen%4) % 4
+	totalLen := 12 + nameLen + padLen
+	req := make([]byte, totalLen)
+	req[0] = x11.OpcodeOpenFont
+	order.PutUint16(req[2:], uint16(totalLen/4))
+	order.PutUint32(req[4:], fid)
+	order.PutUint16(req[8:], uint16(nameLen))
+	copy(req[12:], name)
+	return req
+}
+
+// makeCloseFont builds a raw X11 CloseFont request for the given font ID.
+func makeCloseFont(fid uint32, order binary.ByteOrder) []byte {
+	req := make([]byte, 8)
+	req[0] = x11.OpcodeCloseFont
+	order.PutUint16(req[2:], 2)
+	order.PutUint32(req[4:], fid)
+	return req
+}
+
 func makeExposeEvent(wid uint32, width, height uint16, seqNum uint32, order binary.ByteOrder) []byte {
 	evt := make([]byte, 32)
 	evt[0] = 12 // Expose event code
@@ -405,8 +506,8 @@ func (s *Server) runSynthesis() {
 		wins := ac.Windows()
 		gcs := ac.GCs()
 		pms := ac.Pixmaps()
-		log.Printf("server: synthesising state for conn %d: %d windows %d GCs %d pixmaps",
-			ac.ID, len(wins), len(gcs), len(pms))
+		log.Printf("server: synthesising state for conn %d: %d windows %d GCs %d pixmaps %d cursors %d fonts",
+			ac.ID, len(wins), len(gcs), len(pms), len(ac.Cursors()), len(ac.Fonts()))
 		s.synthesiseAppConn(ac)
 	}
 

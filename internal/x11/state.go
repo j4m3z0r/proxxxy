@@ -51,12 +51,17 @@ func (f Font) OpenReq() []byte { return f.openReq }
 
 // Cursor represents a tracked X11 cursor (CreateCursor or CreateGlyphCursor).
 type Cursor struct {
-	ID        uint32
-	createReq []byte // raw CreateCursor or CreateGlyphCursor request
+	ID          uint32
+	createReq   []byte // raw CreateCursor or CreateGlyphCursor request
+	srcFontName string // for CreateGlyphCursor: name of source font at creation time
 }
 
 // CreateReq returns the raw cursor-creation request bytes.
 func (c Cursor) CreateReq() []byte { return c.createReq }
+
+// SrcFontName returns the name of the source font used by CreateGlyphCursor
+// (empty string for CreateCursor or if the font name was not available).
+func (c Cursor) SrcFontName() string { return c.srcFontName }
 
 // Picture represents a RENDER extension Picture resource.
 type Picture struct {
@@ -92,6 +97,7 @@ type AppConn struct {
 	gcs        map[uint32]*GC
 	pixmaps    map[uint32]*Pixmap
 	fonts      map[uint32]*Font
+	fontNames  map[uint32]string // permanent registry: font ID → name, never deleted on CloseFont
 	cursors    map[uint32]*Cursor
 	seqNum     uint32
 	setupReq   []byte // X11 connection setup request from app
@@ -109,6 +115,7 @@ func NewAppConn(id uint32, order ByteOrder) *AppConn {
 		gcs:       make(map[uint32]*GC),
 		pixmaps:   make(map[uint32]*Pixmap),
 		fonts:     make(map[uint32]*Font),
+		fontNames: make(map[uint32]string),
 		cursors:   make(map[uint32]*Cursor),
 		pictures:  make(map[uint32]*Picture),
 		glyphSets: make(map[uint32]*GlyphSet),
@@ -341,6 +348,9 @@ func (a *AppConn) handleOpenFont(req []byte) {
 	cp := make([]byte, len(req))
 	copy(cp, req)
 	a.fonts[fid] = &Font{ID: fid, Name: name, openReq: cp}
+	// Persist the name even after CloseFont so CreateGlyphCursor requests that
+	// arrive after the font is closed can still recover the name for synthesis.
+	a.fontNames[fid] = name
 }
 
 func (a *AppConn) handleCloseFont(req []byte) {
@@ -358,7 +368,17 @@ func (a *AppConn) handleCreateCursor(req []byte) {
 	cid := U32(req, 4, a.Order)
 	cp := make([]byte, len(req))
 	copy(cp, req)
-	a.cursors[cid] = &Cursor{ID: cid, createReq: cp}
+	cur := &Cursor{ID: cid, createReq: cp}
+	// For CreateGlyphCursor, save the source font name using the permanent
+	// registry (fontNames). The font may have been closed already (or may be
+	// closed later), but we still need the name to reopen it during synthesis.
+	if req[0] == OpcodeCreateGlyphCursor {
+		srcFontID := U32(req, 8, a.Order)
+		if name, ok := a.fontNames[srcFontID]; ok {
+			cur.srcFontName = name
+		}
+	}
+	a.cursors[cid] = cur
 }
 
 func (a *AppConn) handleFreeCursor(req []byte) {

@@ -23,6 +23,29 @@ type idRemap struct {
 	order   binary.ByteOrder
 }
 
+// remapGCValueList remaps resource-holding fields in a GC value-list.
+// maskOff is the byte offset of the 4-byte value-mask; listOff is the byte
+// offset of the first value. Remaps GCTile (bit 10), GCStipple (bit 11),
+// GCFont (bit 14), and GCClipMask (bit 19) — all hold app-space resource IDs.
+func remapGCValueList(out []byte, maskOff, listOff int, order binary.ByteOrder, remap func(int)) {
+	if len(out) < maskOff+4 {
+		return
+	}
+	valueMask := order.Uint32(out[maskOff:])
+	for _, targetBit := range [4]uint{10, 11, 14, 19} {
+		if valueMask&(1<<targetBit) == 0 {
+			continue
+		}
+		off := listOff
+		for b := uint(0); b < targetBit; b++ {
+			if valueMask&(1<<b) != 0 {
+				off += 4
+			}
+		}
+		remap(off)
+	}
+}
+
 // applyIDRemap rewrites resource IDs in cmd that belong to the old connection's
 // range into the corresponding IDs in the new connection's range. Returns a
 // modified copy; the original is not modified.
@@ -95,34 +118,17 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 	case x11.OpcodeCreateGC:
 		remap(4) // GC ID
 		remap(8) // drawable
-		// Remap GCFont (bit 14) in the value-list if present.
-		// Font IDs are allocated from the app's ridBase/ridMask space.
+		// Remap GC value-list fields that hold resource IDs:
+		//   bit 10: GCTile (pixmap), bit 11: GCStipple (pixmap),
+		//   bit 14: GCFont (font),   bit 19: GCClipMask (pixmap, None=0 safe).
 		if len(out) >= 16 {
-			valueMask := r.order.Uint32(out[12:16])
-			if valueMask&(1<<14) != 0 {
-				fontOff := 16
-				for bit := uint(0); bit < 14; bit++ {
-					if valueMask&(1<<bit) != 0 {
-						fontOff += 4
-					}
-				}
-				remap(fontOff)
-			}
+			remapGCValueList(out, 12, 16, r.order, remap)
 		}
 	case x11.OpcodeChangeGC:
 		remap(4) // GC ID
-		// Remap GCFont (bit 14) in the value-list if present.
+		// Same resource-bearing value-list fields as CreateGC.
 		if len(out) >= 12 {
-			valueMask := r.order.Uint32(out[8:12])
-			if valueMask&(1<<14) != 0 {
-				fontOff := 12
-				for bit := uint(0); bit < 14; bit++ {
-					if valueMask&(1<<bit) != 0 {
-						fontOff += 4
-					}
-				}
-				remap(fontOff)
-			}
+			remapGCValueList(out, 8, 12, r.order, remap)
 		}
 	case x11.OpcodeFreeGC:
 		remap(4)

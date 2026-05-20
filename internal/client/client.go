@@ -46,9 +46,37 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 	opcode := cmd[0]
 	switch opcode {
 	case x11.OpcodeCreateWindow:
-		remap(4)  // window ID
-		remap(8)  // parent window ID
-	case x11.OpcodeChangeWindowAttributes, x11.OpcodeGetWindowAttributes,
+		remap(4) // window ID
+		remap(8) // parent window ID
+		// Remap CWCursor (bit 14) in value-list. Cursors are in app ridBase space.
+		if len(out) >= 32 {
+			valueMask := r.order.Uint32(out[28:32])
+			if valueMask&(1<<14) != 0 {
+				cursorOff := 32
+				for bit := uint(0); bit < 14; bit++ {
+					if valueMask&(1<<bit) != 0 {
+						cursorOff += 4
+					}
+				}
+				remap(cursorOff)
+			}
+		}
+	case x11.OpcodeChangeWindowAttributes:
+		remap(4) // window
+		// Remap CWCursor (bit 14) in value-list.
+		if len(out) >= 12 {
+			valueMask := r.order.Uint32(out[8:12])
+			if valueMask&(1<<14) != 0 {
+				cursorOff := 12
+				for bit := uint(0); bit < 14; bit++ {
+					if valueMask&(1<<bit) != 0 {
+						cursorOff += 4
+					}
+				}
+				remap(cursorOff)
+			}
+		}
+	case x11.OpcodeGetWindowAttributes,
 		x11.OpcodeDestroyWindow, x11.OpcodeMapWindow, x11.OpcodeUnmapWindow,
 		x11.OpcodeMapSubwindows, x11.OpcodeUnmapSubwindows,
 		x11.OpcodeConfigureWindow, x11.OpcodeGetGeometry, x11.OpcodeQueryTree,
@@ -103,6 +131,16 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		remap(8) // dst GC
 	case x11.OpcodeOpenFont, x11.OpcodeCloseFont:
 		remap(4) // font ID
+	case x11.OpcodeCreateCursor:
+		remap(4)  // cursor ID
+		remap(8)  // source pixmap
+		remap(12) // mask pixmap (None=0 passes through safely)
+	case x11.OpcodeCreateGlyphCursor:
+		remap(4)  // cursor ID
+		remap(8)  // source font
+		remap(12) // mask font (may be same as source or 0)
+	case x11.OpcodeFreeCursor, x11.OpcodeRecolorCursor:
+		remap(4) // cursor ID
 	case x11.OpcodeClearArea:
 		remap(4) // window
 	case x11.OpcodeCopyArea, x11.OpcodeCopyPlane:
@@ -517,12 +555,14 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 		}
 	}()
 
-	// Phase 1: drain until SESSION_LIVE fires. Uses select so we don't block
-	// on readMsg — SESSION_LIVE may arrive between X messages.
+	// Phase 1: drain until SESSION_LIVE fires. Transition immediately on done
+	// so we do not consume and discard the first live reply (e.g. from an
+	// XSync the app issues in its Expose handler). Buffered synthesis errors/
+	// events are drained in Phase 2 before the GetInputFocus barrier reply.
 	for {
 		select {
 		case <-done:
-			done = nil // nil channel blocks forever; disables this arm
+			goto phase2
 		case m := <-msgs:
 			if m.err != nil {
 				return
@@ -532,9 +572,6 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 				minor := order.Uint16(m.hdr[8:10])
 				log.Printf("client: synthRelay conn %d: X error during synthesis: code=%d major=%d minor=%d badID=0x%08x",
 					connID, m.hdr[1], m.hdr[10], minor, badID)
-			}
-			if done == nil {
-				goto phase2
 			}
 		}
 	}

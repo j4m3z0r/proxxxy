@@ -75,6 +75,33 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		}
 	}
 
+	// 2.6. Cursors: create after pixmaps and fonts (CreateCursor uses pixmaps;
+	// CreateGlyphCursor uses fonts). Skip cursors whose source resource is gone.
+	for _, cur := range ac.Cursors() {
+		cr := cur.CreateReq()
+		if len(cr) < 16 {
+			continue
+		}
+		switch cr[0] {
+		case x11.OpcodeCreateCursor:
+			srcPM := ac.Order.Uint32(cr[8:12])
+			if _, ok := pixmaps[srcPM]; !ok {
+				log.Printf("server: synthesis conn %d: skip CreateCursor 0x%08x (source pixmap 0x%08x gone)",
+					ac.ID, cur.ID, srcPM)
+				continue
+			}
+		case x11.OpcodeCreateGlyphCursor:
+			srcFont := ac.Order.Uint32(cr[8:12])
+			if _, ok := fonts[srcFont]; !ok {
+				log.Printf("server: synthesis conn %d: skip CreateGlyphCursor 0x%08x (source font 0x%08x gone)",
+					ac.ID, cur.ID, srcFont)
+				continue
+			}
+		}
+		log.Printf("server: synthesis conn %d: CreateCursor 0x%08x opcode=%d", ac.ID, cur.ID, cr[0])
+		s.sendToClient(ac.ID, cr)
+	}
+
 	// 3. GCs: create + replay all attribute changes.
 	// Must come before pixmap draw commands since draws reference GC IDs.
 	gcs := ac.GCs()
@@ -195,42 +222,51 @@ func (s *Server) synthesisExpose(ac *x11.AppConn) {
 	}
 }
 
-// sanitizeCreateWindow removes the CWColormap attribute from a CreateWindow
-// request and resets depth and visual to CopyFromParent (0). This prevents
-// synthesis from failing when the original colormap was created by a
-// now-dead X connection: without CWColormap, X inherits the parent's colormap,
-// and without an explicit visual/depth, X inherits those too (always valid for
-// children of the root window).
+// sanitizeCreateWindow removes the CWColormap and CWCursor attributes from a
+// CreateWindow request. CWColormap removal prevents BadColor when the original
+// colormap was created by a now-dead connection; CWCursor removal prevents
+// BadCursor because cursors are synthesized in step 2.6, after windows. Depth
+// and visual are reset to CopyFromParent (0) alongside CWColormap removal.
 func sanitizeCreateWindow(req []byte, order binary.ByteOrder) []byte {
 	if len(req) < 32 || req[0] != x11.OpcodeCreateWindow {
 		return req
 	}
-	valueMask := order.Uint32(req[28:32])
-	if valueMask&(1<<13) == 0 {
-		// No CWColormap — nothing to strip.
+	// Strip CWColormap (bit 13).
+	req = stripCreateWindowAttr(req, 13, order)
+	if len(req) >= 32 {
+		// Also reset depth and visual to CopyFromParent.
+		req[1] = 0
+		order.PutUint32(req[24:28], 0)
+	}
+	// Strip CWCursor (bit 14): cursors are not yet synthesized at this point.
+	req = stripCreateWindowAttr(req, 14, order)
+	return req
+}
+
+// stripCreateWindowAttr removes the value for a single attribute bit from a
+// CreateWindow request's value list and clears that bit in the value mask.
+func stripCreateWindowAttr(req []byte, bit uint, order binary.ByteOrder) []byte {
+	if len(req) < 32 {
 		return req
 	}
-
-	// Locate the colormap value in the value-list (values ordered by bit position).
+	valueMask := order.Uint32(req[28:32])
+	if valueMask&(1<<bit) == 0 {
+		return req
+	}
 	off := 32
-	for bit := uint(0); bit < 13; bit++ {
-		if valueMask&(1<<bit) != 0 {
+	for b := uint(0); b < bit; b++ {
+		if valueMask&(1<<b) != 0 {
 			off += 4
 		}
 	}
 	if len(req) < off+4 {
 		return req
 	}
-
-	// Build a new request omitting the 4-byte colormap value.
 	out := make([]byte, len(req)-4)
 	copy(out, req[:off])
 	copy(out[off:], req[off+4:])
-
-	order.PutUint32(out[28:32], valueMask&^uint32(1<<13)) // clear CWColormap
-	out[1] = 0                                             // depth = CopyFromParent
-	order.PutUint32(out[24:28], 0)                         // visual = CopyFromParent
-	order.PutUint16(out[2:4], uint16(len(out)/4))          // recompute length
+	order.PutUint32(out[28:32], valueMask&^(1<<bit))
+	order.PutUint16(out[2:4], uint16(len(out)/4))
 	return out
 }
 

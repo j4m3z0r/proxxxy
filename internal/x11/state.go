@@ -49,6 +49,15 @@ type Font struct {
 // OpenReq returns the raw X11 OpenFont request bytes.
 func (f Font) OpenReq() []byte { return f.openReq }
 
+// Cursor represents a tracked X11 cursor (CreateCursor or CreateGlyphCursor).
+type Cursor struct {
+	ID        uint32
+	createReq []byte // raw CreateCursor or CreateGlyphCursor request
+}
+
+// CreateReq returns the raw cursor-creation request bytes.
+func (c Cursor) CreateReq() []byte { return c.createReq }
+
 // Picture represents a RENDER extension Picture resource.
 type Picture struct {
 	ID         uint32
@@ -83,6 +92,7 @@ type AppConn struct {
 	gcs        map[uint32]*GC
 	pixmaps    map[uint32]*Pixmap
 	fonts      map[uint32]*Font
+	cursors    map[uint32]*Cursor
 	seqNum     uint32
 	setupReq   []byte // X11 connection setup request from app
 	ridBase    uint32 // resource-id-base from real X server setup reply
@@ -99,6 +109,7 @@ func NewAppConn(id uint32, order ByteOrder) *AppConn {
 		gcs:       make(map[uint32]*GC),
 		pixmaps:   make(map[uint32]*Pixmap),
 		fonts:     make(map[uint32]*Font),
+		cursors:   make(map[uint32]*Cursor),
 		pictures:  make(map[uint32]*Picture),
 		glyphSets: make(map[uint32]*GlyphSet),
 	}
@@ -140,6 +151,10 @@ func (a *AppConn) ProcessRequest(req []byte) {
 		a.handleOpenFont(req)
 	case OpcodeCloseFont:
 		a.handleCloseFont(req)
+	case OpcodeCreateCursor, OpcodeCreateGlyphCursor:
+		a.handleCreateCursor(req)
+	case OpcodeFreeCursor:
+		a.handleFreeCursor(req)
 	case OpcodeRender:
 		a.handleRender(req)
 	default:
@@ -335,6 +350,24 @@ func (a *AppConn) handleCloseFont(req []byte) {
 	delete(a.fonts, U32(req, 4, a.Order))
 }
 
+func (a *AppConn) handleCreateCursor(req []byte) {
+	// Both CreateCursor and CreateGlyphCursor have cid at [4:8].
+	if len(req) < 16 {
+		return
+	}
+	cid := U32(req, 4, a.Order)
+	cp := make([]byte, len(req))
+	copy(cp, req)
+	a.cursors[cid] = &Cursor{ID: cid, createReq: cp}
+}
+
+func (a *AppConn) handleFreeCursor(req []byte) {
+	if len(req) < 8 {
+		return
+	}
+	delete(a.cursors, U32(req, 4, a.Order))
+}
+
 var drawTargetOpcodes = map[byte]bool{
 	OpcodeClearArea: true, OpcodeCopyArea: true, OpcodeCopyPlane: true,
 	OpcodePolyPoint: true, OpcodePolyLine: true, OpcodePolySegment: true,
@@ -403,6 +436,17 @@ func (a *AppConn) Pixmaps() map[uint32]Pixmap {
 		p := *v                                          // copy struct
 		p.DrawCmds = append([][]byte(nil), v.DrawCmds...) // deep copy slice of slices
 		out[k] = p
+	}
+	return out
+}
+
+// Cursors returns a snapshot of all currently tracked cursors.
+func (a *AppConn) Cursors() map[uint32]Cursor {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32]Cursor, len(a.cursors))
+	for k, v := range a.cursors {
+		out[k] = *v
 	}
 	return out
 }

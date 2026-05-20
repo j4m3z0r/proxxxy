@@ -99,6 +99,7 @@ The encoder (`compress.Encoder`) is fully implemented and tested but **not wired
 
 - **`cmd/ctl`** stats CLI dials `localhost:7101` and expects JSON, but the server has no stats endpoint. Stub only.
 - **Font state** is tracked. `AppConn` records each `OpenFont`/`CloseFont` with the raw request bytes. Synthesis replays `OpenFont` before `CreateGC` (step 2.5), and `sanitizeGCFont` strips `GCFont` from any `CreateGC` whose font was closed before reconnect. `applyIDRemap` in the client also remaps the `GCFont` value-list slot for `CreateGC`/`ChangeGC` when ridBase changes.
+- **Cursor state** is tracked. `AppConn` records each `CreateCursor`/`CreateGlyphCursor`/`FreeCursor`. Synthesis replays them in step 2.6 (after pixmaps and fonts which they reference), skipping any whose source pixmap/font is gone. `sanitizeCreateWindow` strips `CWCursor` (bit 14) from `CreateWindow` since cursors are synthesized after windows. `applyIDRemap` remaps cursor IDs in `ChangeWindowAttributes` and `CreateWindow` value lists when ridBase changes.
 - **No tests** for `internal/client`.
 - **DrawCmds may reference freed GCs** — synthesis replays pixmap draw history which may include commands sent with GCs that were later freed. The synthesis now skips such commands (GC liveness filter in step 5), but pixmap content may be slightly incomplete until the Expose-triggered redraw.
 

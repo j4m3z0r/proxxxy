@@ -56,6 +56,10 @@ const (
 	OpcodeAllocNamedColor        = 85
 	OpcodeLookupColor            = 92
 	OpcodeFreeColors             = 88
+	OpcodeCreateCursor           = 93
+	OpcodeCreateGlyphCursor      = 94
+	OpcodeFreeCursor             = 95
+	OpcodeRecolorCursor          = 96
 	OpcodeOpenFont               = 45
 	OpcodeCloseFont              = 46
 	OpcodeQueryFont              = 47

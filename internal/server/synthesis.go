@@ -80,14 +80,27 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		}
 	}
 
-	// 4. Pixmap draw commands: replay after GCs exist.
+	// 4. RENDER Pictures: recreate before pixmap draw commands, since those
+	//    may reference picture objects via RENDER draw calls.
+	for _, pic := range ac.Pictures() {
+		if cr := pic.CreateReq(); len(cr) > 0 {
+			log.Printf("server: synthesis conn %d: CreatePicture 0x%08x drawable=0x%08x",
+				ac.ID, pic.ID, pic.Drawable)
+			s.sendToClient(ac.ID, cr)
+			for _, cmd := range pic.ChangeCmds {
+				s.sendToClient(ac.ID, cmd)
+			}
+		}
+	}
+
+	// 5. Pixmap draw commands: replay after GCs and Pictures exist.
 	for _, pm := range pixmaps {
 		for _, cmd := range pm.DrawCmds {
 			s.sendToClient(ac.ID, cmd)
 		}
 	}
 
-	// 5. Map windows.
+	// 6. Map windows.
 	for _, root := range roots {
 		s.synthesiseWindowMap(ac.ID, windows, root, ac.Order)
 	}

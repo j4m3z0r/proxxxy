@@ -80,6 +80,37 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		remap(4)  // src drawable
 		remap(8)  // dst drawable
 		remap(12) // GC
+	case x11.OpcodeRender:
+		// RENDER extension: minor opcode at byte[1] determines field layout.
+		// We remap Picture IDs and drawable IDs; PictFormat IDs are global
+		// server constants (small values outside the app's resource range) and
+		// pass through the range check unchanged.
+		if len(cmd) < 2 {
+			return out
+		}
+		switch cmd[1] {
+		case x11.RenderCreatePicture:
+			remap(4)  // pid
+			remap(8)  // drawable
+		case x11.RenderChangePicture:
+			remap(4)  // pid
+		case x11.RenderFreePicture:
+			remap(4)  // pid
+		case x11.RenderComposite:
+			remap(8)  // src picture
+			remap(12) // mask picture (None=0 passes through safely)
+			remap(16) // dst picture
+		case x11.RenderTrapezoids, x11.RenderTriangles, x11.RenderTriStrip, x11.RenderTriFan:
+			remap(8)  // src picture
+			remap(12) // dst picture
+		case x11.RenderSetPictureTransform:
+			remap(4) // pic
+		case x11.RenderSetPictureFilter:
+			remap(4) // pic
+		case x11.RenderCreateSolidFill, x11.RenderCreateLinearGradient,
+			x11.RenderCreateRadialGradient, x11.RenderCreateConicalGradient:
+			remap(4) // pid only; no drawable
+		}
 	default:
 		// Draw commands and anything else: drawable at [4], GC at [8].
 		remap(4)

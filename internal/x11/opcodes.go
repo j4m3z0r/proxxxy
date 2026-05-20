@@ -75,3 +75,30 @@ const (
 	ReplyDiscriminator = 1
 	ErrorDiscriminator = 0
 )
+
+// OpcodeRender is the major opcode assigned to the RENDER extension by X.org.
+// This value is conventional rather than guaranteed — it is the opcode in
+// practice on virtually all X.org servers, but strictly speaking it is
+// assigned at server start-up and could differ. We use it to track Picture
+// objects so that synthesis can recreate them after reconnect.
+const OpcodeRender = 139
+
+// RENDER extension minor opcodes relevant to resource tracking.
+const (
+	RenderCreatePicture       = 4
+	RenderChangePicture       = 5
+	RenderFreePicture         = 7
+	RenderComposite           = 8
+	RenderTrapezoids          = 10
+	RenderTriangles           = 11
+	RenderTriStrip            = 12
+	RenderTriFan              = 13
+	RenderSetPictureTransform = 28
+	RenderSetPictureFilter    = 30
+	// Extended picture constructors (RENDER protocol v0.7+).
+	// These create Picture resources without a backing drawable.
+	RenderCreateSolidFill       = 33
+	RenderCreateLinearGradient  = 34
+	RenderCreateRadialGradient  = 35
+	RenderCreateConicalGradient = 36
+)

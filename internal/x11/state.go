@@ -45,6 +45,17 @@ type Font struct {
 	Name string
 }
 
+// Picture represents a RENDER extension Picture resource.
+type Picture struct {
+	ID         uint32
+	Drawable   uint32 // window or pixmap that backs this picture
+	createReq  []byte // raw RenderCreatePicture request bytes
+	ChangeCmds [][]byte
+}
+
+// CreateReq returns the raw RenderCreatePicture request bytes.
+func (p Picture) CreateReq() []byte { return p.createReq }
+
 // AppConn is the per-application-connection state maintained by the server.
 type AppConn struct {
 	ID    uint32
@@ -58,17 +69,19 @@ type AppConn struct {
 	seqNum   uint32
 	setupReq []byte // X11 connection setup request from app
 	ridBase  uint32 // resource-id-base from real X server setup reply
+	pictures map[uint32]*Picture
 	ridMask  uint32 // resource-id-mask from real X server setup reply
 }
 
 func NewAppConn(id uint32, order ByteOrder) *AppConn {
 	return &AppConn{
-		ID:      id,
-		Order:   order,
-		windows: make(map[uint32]*Window),
-		gcs:     make(map[uint32]*GC),
-		pixmaps: make(map[uint32]*Pixmap),
-		fonts:   make(map[uint32]*Font),
+		ID:       id,
+		Order:    order,
+		windows:  make(map[uint32]*Window),
+		gcs:      make(map[uint32]*GC),
+		pixmaps:  make(map[uint32]*Pixmap),
+		fonts:    make(map[uint32]*Font),
+		pictures: make(map[uint32]*Picture),
 	}
 }
 
@@ -108,6 +121,8 @@ func (a *AppConn) ProcessRequest(req []byte) {
 		a.handleOpenFont(req)
 	case OpcodeCloseFont:
 		a.handleCloseFont(req)
+	case OpcodeRender:
+		a.handleRender(req)
 	default:
 		a.maybeTrackDrawCmd(opcode, req)
 	}
@@ -415,6 +430,64 @@ func (g GC) CreateReq() []byte { return g.createReq }
 
 // CreateReq returns the raw X11 CreatePixmap request bytes.
 func (p Pixmap) CreateReq() []byte { return p.createReq }
+
+func (a *AppConn) handleRender(req []byte) {
+	if len(req) < 8 {
+		return
+	}
+	switch req[1] { // RENDER minor opcode
+	case RenderCreatePicture:
+		// Layout: [139:1][4:1][len:2][pid:4][drawable:4][format:4][value-mask:4]...
+		if len(req) < 16 {
+			return
+		}
+		pid := a.Order.Uint32(req[4:8])
+		drawable := a.Order.Uint32(req[8:12])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.pictures[pid] = &Picture{ID: pid, Drawable: drawable, createReq: cp}
+	case RenderCreateSolidFill, RenderCreateLinearGradient,
+		RenderCreateRadialGradient, RenderCreateConicalGradient:
+		// Layout: [139:1][minor:1][len:2][pid:4][...gradient/color data...]
+		// No backing drawable; pid is the only resource reference.
+		if len(req) < 8 {
+			return
+		}
+		pid := a.Order.Uint32(req[4:8])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.pictures[pid] = &Picture{ID: pid, Drawable: 0, createReq: cp}
+	case RenderChangePicture:
+		// Layout: [139:1][5:1][len:2][pid:4][value-mask:4]...
+		pid := a.Order.Uint32(req[4:8])
+		if p, ok := a.pictures[pid]; ok {
+			cp := make([]byte, len(req))
+			copy(cp, req)
+			p.ChangeCmds = append(p.ChangeCmds, cp)
+		}
+	case RenderFreePicture:
+		// Layout: [139:1][7:1][len:2][pid:4]
+		delete(a.pictures, a.Order.Uint32(req[4:8]))
+	}
+}
+
+// Pictures returns a snapshot of all tracked RENDER pictures.
+func (a *AppConn) Pictures() map[uint32]Picture {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32]Picture, len(a.pictures))
+	for k, v := range a.pictures {
+		p := Picture{ID: v.ID, Drawable: v.Drawable}
+		if len(v.createReq) > 0 {
+			p.createReq = append([]byte(nil), v.createReq...)
+		}
+		for _, cmd := range v.ChangeCmds {
+			p.ChangeCmds = append(p.ChangeCmds, append([]byte(nil), cmd...))
+		}
+		out[k] = p
+	}
+	return out
+}
 
 func removeID(s []uint32, id uint32) []uint32 {
 	out := s[:0]

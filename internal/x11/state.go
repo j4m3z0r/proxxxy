@@ -23,10 +23,11 @@ type Window struct {
 
 // GC represents a tracked X11 graphics context.
 type GC struct {
-	ID         uint32
-	Drawable   uint32
-	createReq  []byte
-	ChangeCmds [][]byte
+	ID            uint32
+	Drawable      uint32
+	DrawableDepth byte // depth of the drawable at GC creation time (0 = unknown)
+	createReq     []byte
+	ChangeCmds    [][]byte
 }
 
 // Pixmap represents a tracked X11 pixmap plus its drawing history.
@@ -105,6 +106,9 @@ type AppConn struct {
 	pictures   map[uint32]*Picture
 	glyphSets  map[uint32]*GlyphSet
 	ridMask    uint32 // resource-id-mask from real X server setup reply
+	shmSegs     map[uint32][]byte // shmseg resource ID → raw ShmAttach request bytes
+	shmPixmaps  map[uint32][]byte // pixmap resource ID → raw ShmCreatePixmap request bytes
+	syncCounters map[uint32][]byte // counter resource ID → raw SyncCreateCounter request bytes
 }
 
 func NewAppConn(id uint32, order ByteOrder) *AppConn {
@@ -119,6 +123,9 @@ func NewAppConn(id uint32, order ByteOrder) *AppConn {
 		cursors:   make(map[uint32]*Cursor),
 		pictures:  make(map[uint32]*Picture),
 		glyphSets: make(map[uint32]*GlyphSet),
+		shmSegs:      make(map[uint32][]byte),
+		shmPixmaps:   make(map[uint32][]byte),
+		syncCounters: make(map[uint32][]byte),
 	}
 }
 
@@ -164,6 +171,10 @@ func (a *AppConn) ProcessRequest(req []byte) {
 		a.handleFreeCursor(req)
 	case OpcodeRender:
 		a.handleRender(req)
+	case OpcodeMITSHM:
+		a.handleMITSHM(req)
+	case OpcodeSYNC:
+		a.handleSYNC(req)
 	default:
 		a.maybeTrackDrawCmd(opcode, req)
 	}
@@ -285,10 +296,18 @@ func (a *AppConn) handleCreateGC(req []byte) {
 	}
 	cp := make([]byte, len(req))
 	copy(cp, req)
+	drawable := U32(req, 8, a.Order)
 	gc := &GC{
 		ID:        U32(req, 4, a.Order),
-		Drawable:  U32(req, 8, a.Order),
+		Drawable:  drawable,
 		createReq: cp,
+	}
+	// Record the drawable's depth so synthesis can find a matching fallback
+	// drawable if the original is gone at reconnect time.
+	if pm, ok := a.pixmaps[drawable]; ok {
+		gc.DrawableDepth = pm.Depth
+	} else if w, ok := a.windows[drawable]; ok {
+		gc.DrawableDepth = w.Depth
 	}
 	a.gcs[gc.ID] = gc
 }
@@ -332,7 +351,9 @@ func (a *AppConn) handleFreePixmap(req []byte) {
 	if len(req) < 8 {
 		return
 	}
-	delete(a.pixmaps, U32(req, 4, a.Order))
+	id := U32(req, 4, a.Order)
+	delete(a.pixmaps, id)
+	delete(a.shmPixmaps, id)
 }
 
 func (a *AppConn) handleOpenFont(req []byte) {
@@ -600,6 +621,102 @@ func (a *AppConn) handleRender(req []byte) {
 			gs.AddGlyphsCmds = append(gs.AddGlyphsCmds, cp)
 		}
 	}
+}
+
+func (a *AppConn) handleMITSHM(req []byte) {
+	if len(req) < 4 {
+		return
+	}
+	switch req[1] { // MIT-SHM minor opcode
+	case SHMAttach:
+		// Layout: [opcode:1][1:1][len:2][shmseg:4][shmid:4][read-only:1][pad:3]
+		if len(req) < 12 {
+			return
+		}
+		seg := a.Order.Uint32(req[4:8])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.shmSegs[seg] = cp
+	case SHMDetach:
+		// Layout: [opcode:1][2:1][len:2][shmseg:4]
+		if len(req) < 8 {
+			return
+		}
+		delete(a.shmSegs, a.Order.Uint32(req[4:8]))
+	case SHMCreatePixmap:
+		// Layout: [opcode:1][5:1][len:2][pid:4][drawable:4][width:2][height:2][depth:1][pad:3][shmseg:4][offset:4]
+		if len(req) < 28 {
+			return
+		}
+		pid := a.Order.Uint32(req[4:8])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.shmPixmaps[pid] = cp
+		// Also register as a pixmap for draw-command tracking and GC drawable fallback.
+		depth := req[16]
+		width := a.Order.Uint16(req[12:14])
+		height := a.Order.Uint16(req[14:16])
+		a.pixmaps[pid] = &Pixmap{ID: pid, Depth: depth, Width: width, Height: height}
+	}
+}
+
+func (a *AppConn) handleSYNC(req []byte) {
+	if len(req) < 4 {
+		return
+	}
+	switch req[1] { // SYNC minor opcode
+	case SYNCCreateCounter:
+		// Layout: [opcode:1][2:1][len:2][counter:4][initial-lo:4][initial-hi:4]
+		if len(req) < 16 {
+			return
+		}
+		counter := a.Order.Uint32(req[4:8])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		a.syncCounters[counter] = cp
+	case SYNCDestroyCounter:
+		// Layout: [opcode:1][6:1][len:2][counter:4]
+		if len(req) < 8 {
+			return
+		}
+		delete(a.syncCounters, a.Order.Uint32(req[4:8]))
+	}
+}
+
+// ShmSegs returns a snapshot of currently-attached MIT-SHM segments.
+// Each value is the raw ShmAttach request that created the segment.
+func (a *AppConn) ShmSegs() map[uint32][]byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32][]byte, len(a.shmSegs))
+	for k, v := range a.shmSegs {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
+}
+
+// ShmPixmaps returns a snapshot of currently-alive MIT-SHM pixmaps.
+// Each value is the raw ShmCreatePixmap request that created the pixmap.
+func (a *AppConn) ShmPixmaps() map[uint32][]byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32][]byte, len(a.shmPixmaps))
+	for k, v := range a.shmPixmaps {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
+}
+
+// SyncCounters returns a snapshot of currently-alive SYNC counters.
+// Each value is the raw SyncCreateCounter request that created the counter.
+func (a *AppConn) SyncCounters() map[uint32][]byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[uint32][]byte, len(a.syncCounters))
+	for k, v := range a.syncCounters {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
 }
 
 // Pictures returns a snapshot of all tracked RENDER pictures.

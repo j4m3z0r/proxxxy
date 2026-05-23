@@ -49,6 +49,24 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		s.sendX11Setup(ac.ID, setupReq, ridBase, ridMask, ac.SeqNum())
 	}
 
+	// 0.5. MIT-SHM segments: re-attach before any draw commands that may use
+	//      ShmPutImage. The shmid in each ShmAttach is still valid (GIMP is alive),
+	//      so the real X server can attach the shared memory to this new connection.
+	for seg, req := range ac.ShmSegs() {
+		log.Printf("server: synthesis conn %d: ShmAttach 0x%08x", ac.ID, seg)
+		s.sendToClient(ac.ID, req)
+	}
+
+	// 0.6. SYNC counters: recreate before live relay starts. GTK windows use
+	//      SYNC counters for the _NET_WM_SYNC_REQUEST protocol. When the WM sends
+	//      a sync request, GTK calls SetCounter on the counter. If the counter does
+	//      not exist (freed when the old connection died), SetCounter returns
+	//      XSyncBadCounter, causing GDK's error handler to abort the process.
+	for ctr, req := range ac.SyncCounters() {
+		log.Printf("server: synthesis conn %d: SyncCreateCounter 0x%08x", ac.ID, ctr)
+		s.sendToClient(ac.ID, req)
+	}
+
 	// 1. Windows: parent-first walk (no mapping yet).
 	windows := ac.Windows()
 	roots := findRoots(windows)
@@ -62,6 +80,36 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		if cr := pm.CreateReq(); len(cr) > 0 {
 			log.Printf("server: synthesis conn %d: CreatePixmap 0x%08x %dx%d depth=%d len=%d",
 				ac.ID, pm.ID, pm.Width, pm.Height, pm.Depth, len(cr))
+			s.sendToClient(ac.ID, cr)
+		}
+	}
+
+	// 2.1. SHM pixmaps: recreate as regular pixmaps with the same ID, depth, and
+	//      dimensions. SHM memory can't cross connections, but the pixmap resource
+	//      ID must exist so that GCs and Pictures created on it can be synthesised.
+	//      Content will be repainted by the app's Expose-triggered redraw.
+	{
+		shmPMs := ac.ShmPixmaps()
+		// Pick any window as drawable (needed to identify the screen).
+		var drawableWin uint32
+		for id := range windows {
+			drawableWin = id
+			break
+		}
+		for pid, req := range shmPMs {
+			depth := req[16]
+			width := ac.Order.Uint16(req[12:14])
+			height := ac.Order.Uint16(req[14:16])
+			log.Printf("server: synthesis conn %d: CreatePixmap(shm) 0x%08x %dx%d depth=%d",
+				ac.ID, pid, width, height, depth)
+			cr := make([]byte, 16)
+			cr[0] = x11.OpcodeCreatePixmap
+			cr[1] = depth
+			ac.Order.PutUint16(cr[2:4], 4) // 4 words = 16 bytes
+			ac.Order.PutUint32(cr[4:8], pid)
+			ac.Order.PutUint32(cr[8:12], drawableWin)
+			ac.Order.PutUint16(cr[12:14], width)
+			ac.Order.PutUint16(cr[14:16], height)
 			s.sendToClient(ac.ID, cr)
 		}
 	}
@@ -123,7 +171,7 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	gcs := ac.GCs()
 	for _, gc := range gcs {
 		if cr := gc.CreateReq(); len(cr) > 0 {
-			cr = sanitizeGCDrawable(cr, gc.Drawable, windows, pixmaps, ac.Order)
+			cr = sanitizeGCDrawable(cr, gc.Drawable, gc.DrawableDepth, windows, pixmaps, ac.Order)
 			cr = sanitizeGCPixmapAttrs(cr, pixmaps, ac.Order)
 			cr = sanitizeGCFont(cr, fonts, ac.Order)
 			log.Printf("server: synthesis conn %d: CreateGC 0x%08x drawable=0x%08x len=%d",
@@ -218,6 +266,35 @@ func (s *Server) synthesiseWindowMap(connID uint32, all map[uint32]x11.Window, w
 	}
 }
 
+// synthesisConfigureNotify injects a fake ConfigureNotify for each mapped
+// window. GTK3/GDK tracks a configure_request_count that it increments when
+// it sends ConfigureWindow and decrements on ConfigureNotify. During the
+// client outage, ConfigureWindow requests from the app were discarded by
+// proxxxy, but configure_request_count was still incremented. Without a
+// matching ConfigureNotify, the count stays > 0, which permanently blocks
+// gdk_window_process_updates_with_mode from drawing. We inject one fake
+// ConfigureNotify per window here (before SESSION_LIVE and before injecting
+// Expose) so that any outstanding count is decremented, the frozen window is
+// thawed, and the Expose can trigger a proper redraw.
+func (s *Server) synthesisConfigureNotify(ac *x11.AppConn) {
+	s.mu.Lock()
+	app := s.appConns[ac.ID]
+	s.mu.Unlock()
+	if app == nil {
+		return
+	}
+	seqNum := ac.SeqNum()
+	for _, w := range ac.Windows() {
+		if !w.Mapped || w.Width == 0 || w.Height == 0 {
+			continue
+		}
+		log.Printf("server: synthesis conn %d: injecting ConfigureNotify for 0x%08x %dx%d",
+			ac.ID, w.ID, w.Width, w.Height)
+		evt := makeConfigureNotifyEvent(w.ID, w.X, w.Y, w.Width, w.Height, w.BorderWidth, seqNum, ac.Order)
+		app.Write(evt) //nolint:errcheck
+	}
+}
+
 // synthesisExpose injects a fake Expose event directly into the app's X socket
 // for each mapped window, causing the app to redraw without the client relay.
 func (s *Server) synthesisExpose(ac *x11.AppConn) {
@@ -248,13 +325,13 @@ func sanitizeCreateWindow(req []byte, order binary.ByteOrder) []byte {
 	if len(req) < 32 || req[0] != x11.OpcodeCreateWindow {
 		return req
 	}
-	// Strip CWColormap (bit 13).
+	// Strip CWColormap (bit 13): the original colormap was created by the app's
+	// X connection which is now dead; keeping it would cause BadColor on the
+	// new display. Depth and visual are intentionally preserved so that
+	// depth-32 ARGB windows keep working on the new display connection (both
+	// displays are xorg-dummy with matching visual IDs, so the original
+	// depth/visual values are valid on the synthesis xconn).
 	req = stripCreateWindowAttr(req, 13, order)
-	if len(req) >= 32 {
-		// Also reset depth and visual to CopyFromParent.
-		req[1] = 0
-		order.PutUint32(req[24:28], 0)
-	}
 	// Strip CWCursor (bit 14): cursors are not yet synthesized at this point.
 	req = stripCreateWindowAttr(req, 14, order)
 	return req
@@ -293,7 +370,7 @@ func stripCreateWindowAttr(req []byte, bit uint, order binary.ByteOrder) []byte 
 // valid window on the same screen keeps the GC usable for drawing.
 // When substituting, GCTile (bit 10) is also stripped: a tile pixmap's depth
 // must match the drawable's depth, and we cannot guarantee that after substitution.
-func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Window, pixmaps map[uint32]x11.Pixmap, order binary.ByteOrder) []byte {
+func sanitizeGCDrawable(req []byte, drawable uint32, drawableDepth byte, windows map[uint32]x11.Window, pixmaps map[uint32]x11.Pixmap, order binary.ByteOrder) []byte {
 	if len(req) < 16 || req[0] != x11.OpcodeCreateGC {
 		return req
 	}
@@ -303,14 +380,43 @@ func sanitizeGCDrawable(req []byte, drawable uint32, windows map[uint32]x11.Wind
 	if _, ok := pixmaps[drawable]; ok {
 		return req
 	}
-	// Drawable is gone — substitute with the first available window.
+	// Drawable is gone — substitute with an InputOutput window that preferably
+	// has the same depth as the original drawable. InputOnly windows (class=2)
+	// cannot be used as GC drawables (BadMatch). If the original drawable depth
+	// is unknown (0), accept any InputOutput window.
+	const classInputOnly = 2
 	var fallbackID uint32
-	for id := range windows {
-		fallbackID = id
-		break
+	for id, w := range windows {
+		if w.Class == classInputOnly {
+			continue
+		}
+		if drawableDepth == 0 || w.Depth == drawableDepth || w.Depth == 0 {
+			fallbackID = id
+			// Prefer an exact depth match: keep looking only if this is a
+			// depth-0 (CopyFromParent) match and we haven't found exact yet.
+			if drawableDepth == 0 || w.Depth == drawableDepth {
+				break
+			}
+		}
 	}
 	if fallbackID == 0 {
-		return req // no windows either (shouldn't happen in practice)
+		// No depth-matched InputOutput window; fall back to any non-InputOnly window.
+		for id, w := range windows {
+			if w.Class != classInputOnly {
+				fallbackID = id
+				break
+			}
+		}
+	}
+	if fallbackID == 0 {
+		// Last resort: any window (e.g. all are InputOnly, which itself would fail).
+		for id := range windows {
+			fallbackID = id
+			break
+		}
+	}
+	if fallbackID == 0 {
+		return req // no windows at all (shouldn't happen in practice)
 	}
 	out := make([]byte, len(req))
 	copy(out, req)
@@ -491,6 +597,37 @@ func makeExposeEvent(wid uint32, width, height uint16, seqNum uint32, order bina
 	return evt
 }
 
+// makeConfigureNotifyEvent builds a synthetic ConfigureNotify event (code 22).
+// X11 ConfigureNotify layout (32 bytes):
+//
+//	[0]   event code = 22
+//	[1]   unused
+//	[2:4] sequence number
+//	[4:8] event window (same as window for non-substructure-redirect)
+//	[8:12] window
+//	[12:16] above-sibling = 0 (None)
+//	[16:18] x
+//	[18:20] y
+//	[20:22] width
+//	[22:24] height
+//	[24:26] border-width
+//	[26]  override-redirect = 0
+func makeConfigureNotifyEvent(wid uint32, x, y int16, width, height, borderWidth uint16, seqNum uint32, order binary.ByteOrder) []byte {
+	evt := make([]byte, 32)
+	evt[0] = 22 // ConfigureNotify
+	order.PutUint16(evt[2:], uint16(seqNum))
+	order.PutUint32(evt[4:], wid)  // event window
+	order.PutUint32(evt[8:], wid)  // window
+	// above-sibling = 0 (None)
+	order.PutUint16(evt[16:], uint16(x))
+	order.PutUint16(evt[18:], uint16(y))
+	order.PutUint16(evt[20:], width)
+	order.PutUint16(evt[22:], height)
+	order.PutUint16(evt[24:], borderWidth)
+	// override-redirect = 0
+	return evt
+}
+
 // runSynthesis sends SESSION_RESUME, synthesised state, then SESSION_LIVE.
 func (s *Server) runSynthesis() {
 	s.WriteToClient(wire.MsgSessionResume, nil)
@@ -511,18 +648,34 @@ func (s *Server) runSynthesis() {
 		s.synthesiseAppConn(ac)
 	}
 
-	// Send SESSION_LIVE before injecting Expose events. This ensures xterm's
-	// redraw responses reach the client after it has entered live-relay mode,
-	// so replies from the synthesis X connection are forwarded (not drained).
-	s.WriteToClient(wire.MsgSessionLive, nil)
+	// Send SESSION_LIVE with the final seqNum for each connection. Between
+	// synthesis start and now, the app may have sent requests that were
+	// discarded (no client or synthActive=true). Those requests incremented
+	// the server-side seqNum but never reached the real X server. The client
+	// uses these final seqNums to compute the correct sequence-number offset so
+	// forwarded replies/errors reach the app with the right sequence numbers.
+	// Payload: [count:4 LE]([connID:4 LE][finalSeqNum:4 LE])...
+	livePayload := make([]byte, 4+len(states)*8)
+	binary.LittleEndian.PutUint32(livePayload[:4], uint32(len(states)))
+	for i, ac := range states {
+		binary.LittleEndian.PutUint32(livePayload[4+i*8:], ac.ID)
+		binary.LittleEndian.PutUint32(livePayload[8+i*8:], ac.SeqNum())
+	}
+	s.WriteToClient(wire.MsgSessionLive, livePayload)
 
-	// Clear live-relay block BEFORE injecting Expose. Draw commands triggered by
+	// Clear live-relay block BEFORE injecting events. Draw commands triggered by
 	// the app's Expose handler must not be discarded by sendMsgsToClient.
 	s.mu.Lock()
 	s.synthActive = false
 	s.mu.Unlock()
 
 	for _, ac := range states {
+		// Inject ConfigureNotify first: during the outage, the app may have sent
+		// ConfigureWindow requests that were discarded (no client), leaving
+		// GTK3's configure_request_count > 0 with a matching freeze. A fake
+		// ConfigureNotify decrements the count and thaws the window so the
+		// subsequent Expose can trigger a proper redraw.
+		s.synthesisConfigureNotify(ac)
 		s.synthesisExpose(ac)
 	}
 }

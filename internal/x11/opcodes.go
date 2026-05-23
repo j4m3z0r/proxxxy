@@ -87,6 +87,30 @@ const (
 // objects so that synthesis can recreate them after reconnect.
 const OpcodeRender = 139
 
+// OpcodeMITSHM is the major opcode assigned to the MIT-SHM extension by X.org.
+// Like OpcodeRender, this is conventional (X.org assigns it consistently) but
+// not guaranteed. We use it to track ShmAttach calls so synthesis can replay
+// them on the new connection, allowing ShmPutImage to work after reconnect.
+const OpcodeMITSHM = 130
+
+// MIT-SHM minor opcodes (shm.h).
+const (
+	SHMAttach       = 1
+	SHMDetach       = 2
+	SHMCreatePixmap = 5
+)
+
+// OpcodeSYNC is the major opcode assigned to the SYNC extension by X.org.
+// We use it to track counter creation/destruction so synthesis can recreate
+// counters, allowing SetCounter to work after reconnect (e.g., for WM sync).
+const OpcodeSYNC = 134
+
+// SYNC minor opcodes (syncproto.h).
+const (
+	SYNCCreateCounter  = 2
+	SYNCDestroyCounter = 6
+)
+
 // RENDER extension minor opcodes (renderproto.h, RENDER protocol v0.11+).
 const (
 	RenderCreatePicture             = 4

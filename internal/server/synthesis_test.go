@@ -54,12 +54,13 @@ func TestSanitizeCreateWindow_StripsColormap(t *testing.T) {
 	if gotLen := binary.LittleEndian.Uint16(out[2:]); gotLen != 12 {
 		t.Errorf("length field: got %d, want 12", gotLen)
 	}
-	// depth and visual reset to CopyFromParent.
-	if out[1] != 0 {
-		t.Errorf("depth: got %d, want 0 (CopyFromParent)", out[1])
+	// depth and visual are preserved (we keep originals so depth-32 ARGB
+	// windows continue to work on the synthesis display).
+	if out[1] != 24 {
+		t.Errorf("depth: got %d, want 24 (preserved)", out[1])
 	}
-	if gotVis := binary.LittleEndian.Uint32(out[24:]); gotVis != 0 {
-		t.Errorf("visual: got 0x%x, want 0 (CopyFromParent)", gotVis)
+	if gotVis := binary.LittleEndian.Uint32(out[24:]); gotVis != 0x00000301 {
+		t.Errorf("visual: got 0x%x, want 0x301 (preserved)", gotVis)
 	}
 	// CWColormap bit cleared from value-mask.
 	if gotMask := binary.LittleEndian.Uint32(out[28:]); gotMask&(1<<13) != 0 {
@@ -80,7 +81,7 @@ func TestSanitizeGCDrawable_ValidWindow(t *testing.T) {
 	windows := map[uint32]x11.Window{0x000003f9: {ID: 0x000003f9}}
 	pixmaps := map[uint32]x11.Pixmap{}
 
-	out := sanitizeGCDrawable(req, 0x000003f9, windows, pixmaps, binary.LittleEndian)
+	out := sanitizeGCDrawable(req, 0x000003f9, 0, windows, pixmaps, binary.LittleEndian)
 	if &out[0] != &req[0] {
 		t.Error("expected same slice when drawable is valid window")
 	}
@@ -95,7 +96,7 @@ func TestSanitizeGCDrawable_ValidPixmap(t *testing.T) {
 	windows := map[uint32]x11.Window{}
 	pixmaps := map[uint32]x11.Pixmap{0x02200007: {ID: 0x02200007}}
 
-	out := sanitizeGCDrawable(req, 0x02200007, windows, pixmaps, binary.LittleEndian)
+	out := sanitizeGCDrawable(req, 0x02200007, 0, windows, pixmaps, binary.LittleEndian)
 	if &out[0] != &req[0] {
 		t.Error("expected same slice when drawable is valid pixmap")
 	}
@@ -110,7 +111,7 @@ func TestSanitizeGCDrawable_MissingDrawable(t *testing.T) {
 	windows := map[uint32]x11.Window{0x02200003: {ID: 0x02200003}}
 	pixmaps := map[uint32]x11.Pixmap{}
 
-	out := sanitizeGCDrawable(req, 0x0220000d, windows, pixmaps, binary.LittleEndian)
+	out := sanitizeGCDrawable(req, 0x0220000d, 0, windows, pixmaps, binary.LittleEndian)
 
 	if &out[0] == &req[0] {
 		t.Error("expected new slice (drawable was substituted)")
@@ -138,7 +139,7 @@ func TestSanitizeGCDrawable_StripsGCTile(t *testing.T) {
 	windows := map[uint32]x11.Window{0x02200003: {ID: 0x02200003}}
 	pixmaps := map[uint32]x11.Pixmap{}
 
-	out := sanitizeGCDrawable(req, 0x0220000d, windows, pixmaps, binary.LittleEndian)
+	out := sanitizeGCDrawable(req, 0x0220000d, 0, windows, pixmaps, binary.LittleEndian)
 
 	if len(out) != 24 {
 		t.Fatalf("expected len=24 (tile stripped), got %d", len(out))

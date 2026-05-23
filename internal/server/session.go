@@ -51,18 +51,46 @@ func drainRequests(app net.Conn, ac *x11.AppConn, enc *compress.Encoder, sendFn 
 			log.Printf("server: drainRequests conn %d read hdr error: %v", ac.ID, err)
 			return
 		}
-		reqHdr, err := x11.ParseRequestHeaderOrder(hdr, ac.Order)
-		if err != nil {
-			log.Printf("server: drainRequests conn %d parse error: %v hdr=%x", ac.ID, err, hdr)
-			return
+
+		var full []byte
+		stdLen := ac.Order.Uint16(hdr[2:4])
+		if stdLen == 0 {
+			// BigRequest extension: length==0 in the standard 2-byte field means
+			// the next 4 bytes hold the actual request length in 4-byte units.
+			// Total request size = extLen*4 bytes (includes both header segments).
+			var extBuf [4]byte
+			if _, err := io.ReadFull(r, extBuf[:]); err != nil {
+				return
+			}
+			extLen := ac.Order.Uint32(extBuf[:])
+			if extLen < 2 {
+				log.Printf("server: drainRequests conn %d: invalid BigRequest length %d hdr=%x", ac.ID, extLen, hdr)
+				return
+			}
+			total := extLen * 4 // total bytes including 4-byte std hdr + 4-byte ext hdr
+			full = make([]byte, total)
+			copy(full[0:4], hdr)
+			copy(full[4:8], extBuf[:])
+			if total > 8 {
+				if _, err := io.ReadFull(r, full[8:]); err != nil {
+					return
+				}
+			}
+		} else {
+			byteLen := uint32(stdLen) * 4
+			if byteLen < 4 {
+				log.Printf("server: drainRequests conn %d: invalid request length %d hdr=%x", ac.ID, stdLen, hdr)
+				return
+			}
+			full = make([]byte, byteLen)
+			copy(full, hdr)
+			if byteLen > 4 {
+				if _, err := io.ReadFull(r, full[4:]); err != nil {
+					return
+				}
+			}
 		}
-		body := make([]byte, reqHdr.ByteLen-4)
-		if _, err := io.ReadFull(r, body); err != nil {
-			return
-		}
-		full := make([]byte, reqHdr.ByteLen)
-		copy(full, hdr)
-		copy(full[4:], body)
+
 		ac.ProcessRequest(full)
 		enc.Stats.BytesIn.Add(int64(len(full)))
 		// Phase 3 encoder bypassed: client-side decoder is not yet production-

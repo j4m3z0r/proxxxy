@@ -56,6 +56,13 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 	out := make([]byte, len(cmd))
 	copy(out, cmd)
 
+	// BigRequest extension: length==0 in standard 2-byte field means the real
+	// length follows as a 4-byte field, shifting all body fields by 4 bytes.
+	s := 0
+	if r.order.Uint16(cmd[2:4]) == 0 && len(cmd) >= 8 {
+		s = 4
+	}
+
 	remap := func(off int) {
 		if len(out) < off+4 {
 			return
@@ -69,13 +76,13 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 	opcode := cmd[0]
 	switch opcode {
 	case x11.OpcodeCreateWindow:
-		remap(4) // window ID
-		remap(8) // parent window ID
+		remap(4 + s) // window ID
+		remap(8 + s) // parent window ID
 		// Remap CWCursor (bit 14) in value-list. Cursors are in app ridBase space.
-		if len(out) >= 32 {
-			valueMask := r.order.Uint32(out[28:32])
+		if len(out) >= 32+s {
+			valueMask := r.order.Uint32(out[28+s : 32+s])
 			if valueMask&(1<<14) != 0 {
-				cursorOff := 32
+				cursorOff := 32 + s
 				for bit := uint(0); bit < 14; bit++ {
 					if valueMask&(1<<bit) != 0 {
 						cursorOff += 4
@@ -85,12 +92,12 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 			}
 		}
 	case x11.OpcodeChangeWindowAttributes:
-		remap(4) // window
+		remap(4 + s) // window
 		// Remap CWCursor (bit 14) in value-list.
-		if len(out) >= 12 {
-			valueMask := r.order.Uint32(out[8:12])
+		if len(out) >= 12+s {
+			valueMask := r.order.Uint32(out[8+s : 12+s])
 			if valueMask&(1<<14) != 0 {
-				cursorOff := 12
+				cursorOff := 12 + s
 				for bit := uint(0); bit < 14; bit++ {
 					if valueMask&(1<<bit) != 0 {
 						cursorOff += 4
@@ -107,52 +114,52 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		x11.OpcodeSetInputFocus, x11.OpcodeCirculateWindow,
 		x11.OpcodeInstallColormap, x11.OpcodeUninstallColormap,
 		x11.OpcodeQueryFont:
-		remap(4) // window / resource ID only
+		remap(4 + s) // window / resource ID only
 	case x11.OpcodeChangeProperty:
-		remap(4) // window (property atom at [8:12] is NOT a resource ID)
+		remap(4 + s) // window (property atom at [8:12] is NOT a resource ID)
 	case x11.OpcodeCreatePixmap:
-		remap(4) // pixmap ID
-		remap(8) // drawable
+		remap(4 + s) // pixmap ID
+		remap(8 + s) // drawable
 	case x11.OpcodeFreePixmap:
-		remap(4)
+		remap(4 + s)
 	case x11.OpcodeCreateGC:
-		remap(4) // GC ID
-		remap(8) // drawable
+		remap(4 + s) // GC ID
+		remap(8 + s) // drawable
 		// Remap GC value-list fields that hold resource IDs:
 		//   bit 10: GCTile (pixmap), bit 11: GCStipple (pixmap),
 		//   bit 14: GCFont (font),   bit 19: GCClipMask (pixmap, None=0 safe).
-		if len(out) >= 16 {
-			remapGCValueList(out, 12, 16, r.order, remap)
+		if len(out) >= 16+s {
+			remapGCValueList(out, 12+s, 16+s, r.order, remap)
 		}
 	case x11.OpcodeChangeGC:
-		remap(4) // GC ID
+		remap(4 + s) // GC ID
 		// Same resource-bearing value-list fields as CreateGC.
-		if len(out) >= 12 {
-			remapGCValueList(out, 8, 12, r.order, remap)
+		if len(out) >= 12+s {
+			remapGCValueList(out, 8+s, 12+s, r.order, remap)
 		}
 	case x11.OpcodeFreeGC:
-		remap(4)
+		remap(4 + s)
 	case x11.OpcodeCopyGC:
-		remap(4) // src GC
-		remap(8) // dst GC
+		remap(4 + s) // src GC
+		remap(8 + s) // dst GC
 	case x11.OpcodeOpenFont, x11.OpcodeCloseFont:
-		remap(4) // font ID
+		remap(4 + s) // font ID
 	case x11.OpcodeCreateCursor:
-		remap(4)  // cursor ID
-		remap(8)  // source pixmap
-		remap(12) // mask pixmap (None=0 passes through safely)
+		remap(4 + s)  // cursor ID
+		remap(8 + s)  // source pixmap
+		remap(12 + s) // mask pixmap (None=0 passes through safely)
 	case x11.OpcodeCreateGlyphCursor:
-		remap(4)  // cursor ID
-		remap(8)  // source font
-		remap(12) // mask font (may be same as source or 0)
+		remap(4 + s)  // cursor ID
+		remap(8 + s)  // source font
+		remap(12 + s) // mask font (may be same as source or 0)
 	case x11.OpcodeFreeCursor, x11.OpcodeRecolorCursor:
-		remap(4) // cursor ID
+		remap(4 + s) // cursor ID
 	case x11.OpcodeClearArea:
-		remap(4) // window
+		remap(4 + s) // window
 	case x11.OpcodeCopyArea, x11.OpcodeCopyPlane:
-		remap(4)  // src drawable
-		remap(8)  // dst drawable
-		remap(12) // GC
+		remap(4 + s)  // src drawable
+		remap(8 + s)  // dst drawable
+		remap(12 + s) // GC
 	case x11.OpcodeRender:
 		// RENDER extension: minor opcode at byte[1] determines field layout.
 		// We remap Picture IDs and drawable IDs; PictFormat IDs are global
@@ -163,56 +170,66 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		}
 		switch cmd[1] {
 		case x11.RenderCreatePicture:
-			remap(4)  // pid
-			remap(8)  // drawable
+			remap(4 + s) // pid
+			remap(8 + s) // drawable
 		case x11.RenderChangePicture:
-			remap(4)  // pid
+			remap(4 + s) // pid
 		case x11.RenderFreePicture:
-			remap(4)  // pid
+			remap(4 + s) // pid
 		case x11.RenderComposite:
-			remap(8)  // src picture
-			remap(12) // mask picture (None=0 passes through safely)
-			remap(16) // dst picture
+			remap(8 + s)  // src picture
+			remap(12 + s) // mask picture (None=0 passes through safely)
+			remap(16 + s) // dst picture
 		case x11.RenderTrapezoids, x11.RenderTriangles, x11.RenderTriStrip, x11.RenderTriFan:
-			remap(8)  // src picture
-			remap(12) // dst picture
+			remap(8 + s)  // src picture
+			remap(12 + s) // dst picture
 		case x11.RenderSetPictureClipRectangles:
-			remap(4) // pic
+			remap(4 + s) // pic
 		case x11.RenderSetPictureTransform:
-			remap(4) // pic
+			remap(4 + s) // pic
 		case x11.RenderSetPictureFilter:
-			remap(4) // pic
+			remap(4 + s) // pic
 		case x11.RenderCreateSolidFill, x11.RenderCreateLinearGradient,
 			x11.RenderCreateRadialGradient, x11.RenderCreateConicalGradient:
-			remap(4) // pid only; no drawable
+			remap(4 + s) // pid only; no drawable
 		// GlyphSet IDs are allocated from the app's ridBase/ridMask space and
 		// need remapping when oldBase != newBase, just like other resource IDs.
 		case x11.RenderCreateGlyphSet:
-			remap(4) // gsid
+			remap(4 + s) // gsid
 		case x11.RenderReferenceGlyphSet:
-			remap(4) // new gsid
-			remap(8) // existing gsid
+			remap(4 + s) // new gsid
+			remap(8 + s) // existing gsid
 		case x11.RenderFreeGlyphSet:
-			remap(4) // gsid
+			remap(4 + s) // gsid
 		case x11.RenderAddGlyphs:
-			remap(4) // gsid (glyph IDs within the set are CARD32 indices, not X resource IDs)
+			remap(4 + s) // gsid (glyph IDs within the set are CARD32 indices, not X resource IDs)
 		// CompositeGlyphs wire layout (RENDER protocol):
 		// [major:1][minor:1][len:2][op:1][pad:3][src:4][dst:4][mask-format:4][glyphset:4]...
 		// src, dst, and glyphset are all in the app's resource-id space.
 		case x11.RenderCompositeGlyphs8, x11.RenderCompositeGlyphs16, x11.RenderCompositeGlyphs32:
-			remap(8)  // src picture
-			remap(12) // dst picture
-			remap(20) // glyphset
+			remap(8 + s)  // src picture
+			remap(12 + s) // dst picture
+			remap(20 + s) // glyphset
 		// FillRectangles: [op:1][pad:3][dst:4][color:8][rects…]
 		case x11.RenderFillRectangles:
-			remap(8) // dst picture
+			remap(8 + s) // dst picture
 		}
 	default:
 		// Draw commands and anything else: drawable at [4], GC at [8].
-		remap(4)
-		remap(8)
+		remap(4 + s)
+		remap(8 + s)
 	}
 	return out
+}
+
+// synthXconnState holds per-connID state needed during the synthesis phase.
+type synthXconnState struct {
+	ridBase     uint32
+	ridMask     uint32
+	rootWin     uint32
+	order       binary.ByteOrder
+	nextScratch uint32            // counts scratch IDs allocated, starting from ridMask downward
+	colormaps   map[uint32]uint32 // visual → scratch colormap ID
 }
 
 // Client connects to a proxxxy-server and forwards X11 traffic to the local display.
@@ -222,20 +239,29 @@ type Client struct {
 	server net.Conn
 	srvW   sync.Mutex // serialises writes to server
 
-	mu        sync.Mutex
-	xConns    map[uint32]net.Conn
-	decoders  map[uint32]*compress.Decoder
-	idRemaps  map[uint32]idRemap    // resource ID remapping for synthesised connections
-	synthDone map[uint32]chan struct{} // closed at SESSION_LIVE to switch synth relays to forward mode
+	mu              sync.Mutex
+	xConns          map[uint32]net.Conn
+	decoders        map[uint32]*compress.Decoder
+	idRemaps        map[uint32]idRemap          // resource ID remapping for synthesised connections
+	synthDone       map[uint32]chan struct{}     // closed at SESSION_LIVE to switch synth relays to forward mode
+	synthOrders     map[uint32]binary.ByteOrder // byte order for each synthesis xconn (needed to format GetInputFocus)
+	synthFinalSeqNums map[uint32]uint32          // final app seqNum per conn, updated just before SESSION_LIVE
+
+	// synthState and inSynthesis are accessed only from the main Run() goroutine.
+	inSynthesis bool
+	synthState  map[uint32]*synthXconnState // connID → synthesis xconn state
 }
 
 func New(serverAddr string) *Client {
 	return &Client{
-		serverAddr: serverAddr,
-		xConns:     make(map[uint32]net.Conn),
-		decoders:   make(map[uint32]*compress.Decoder),
-		idRemaps:   make(map[uint32]idRemap),
-		synthDone:  make(map[uint32]chan struct{}),
+		serverAddr:        serverAddr,
+		xConns:            make(map[uint32]net.Conn),
+		decoders:          make(map[uint32]*compress.Decoder),
+		idRemaps:          make(map[uint32]idRemap),
+		synthDone:         make(map[uint32]chan struct{}),
+		synthOrders:       make(map[uint32]binary.ByteOrder),
+		synthFinalSeqNums: make(map[uint32]uint32),
+		synthState:        make(map[uint32]*synthXconnState),
 	}
 }
 
@@ -268,6 +294,7 @@ func (c *Client) Run() error {
 
 	// SESSION_RESUME phase: consume synthesised state.
 	// synthRelay goroutines run immediately but stay in drain mode until SESSION_LIVE.
+	c.inSynthesis = true
 	for {
 		msg, err = wire.Read(conn)
 		if err != nil {
@@ -285,17 +312,43 @@ func (c *Client) Run() error {
 			c.handleCompressed(msg)
 		}
 	}
+	c.inSynthesis = false
 
 	// SESSION_LIVE: switch synthesis relays to live-forward mode.
-	// The synthesis X connections stay in xConns so live traffic continues through
-	// them (they hold the synthesised resources). synthRelay goroutines switch from
-	// drain-all to forward-replies-and-events mode.
+	// The payload carries the final seqNum per connID so synthRelay can
+	// compute the correct seqOffset, accounting for requests the app sent
+	// during synthesis that were discarded (never reached the real X server).
+	// Payload format: [count:4 LE]([connID:4 LE][finalSeqNum:4 LE])...
+	//
+	// Send GetInputFocus to each synthesis xconn HERE, before entering the live
+	// message loop. This guarantees GetInputFocus is the first request the real X
+	// server sees after synthesis commands — preventing a race where a live query
+	// from the app (triggered by the Expose we inject) could arrive at the
+	// synthesis xconn first and cause synthRelay Phase 2 to capture the wrong
+	// nSynth, making seqOffset wrong and breaking all subsequent reply routing.
+	livePayload := msg.Payload
 	c.mu.Lock()
-	for _, done := range c.synthDone {
+	if len(livePayload) >= 4 {
+		count := int(binary.LittleEndian.Uint32(livePayload[:4]))
+		for i := 0; i < count && 4+i*8+8 <= len(livePayload); i++ {
+			cid := binary.LittleEndian.Uint32(livePayload[4+i*8:])
+			seq := binary.LittleEndian.Uint32(livePayload[8+i*8:])
+			c.synthFinalSeqNums[cid] = seq
+		}
+	}
+	for connID, done := range c.synthDone {
+		if xconn, ok := c.xConns[connID]; ok {
+			ord := c.synthOrders[connID]
+			barrier := [4]byte{x11.OpcodeGetInputFocus, 0}
+			ord.PutUint16(barrier[2:], 1)
+			xconn.Write(barrier[:]) //nolint:errcheck
+		}
 		close(done)
 	}
 	c.synthDone = make(map[uint32]chan struct{})
+	c.synthOrders = make(map[uint32]binary.ByteOrder)
 	c.mu.Unlock()
+	c.synthState = make(map[uint32]*synthXconnState)
 
 	log.Println("client: live")
 
@@ -347,7 +400,7 @@ func (c *Client) handleX11Setup(payload []byte) {
 	// Read and consume the setup reply (to complete the handshake).
 	// We do NOT forward it to the server/app — the app still has its original
 	// setup state from the previous session.
-	newBase, err := readAndConsumeSetupReply(xconn, setupBytes[0])
+	newBase, newMask, rootWin, err := readAndConsumeSetupReply(xconn, setupBytes[0])
 	if err != nil {
 		log.Println("client: read X setup reply:", err)
 		xconn.Close()
@@ -357,6 +410,14 @@ func (c *Client) handleX11Setup(payload []byte) {
 	var order binary.ByteOrder = binary.LittleEndian
 	if setupBytes[0] == 0x42 {
 		order = binary.BigEndian
+	}
+
+	// Enable BigRequests on the synthesis xconn so that GIMP's large requests
+	// (and their DrawCmd replays) are accepted by the real X server.
+	if err := enableBigRequests(xconn, order); err != nil {
+		log.Println("client: enableBigRequests:", err)
+		xconn.Close()
+		return
 	}
 
 	c.mu.Lock()
@@ -384,16 +445,62 @@ func (c *Client) handleX11Setup(payload []byte) {
 	// are still discarded because their sequence numbers are synthesis-internal.
 	done := make(chan struct{})
 	c.synthDone[connID] = done
+	c.synthOrders[connID] = order
+	c.synthFinalSeqNums[connID] = appSeqNum // initial; updated by MsgSessionLive
 	c.mu.Unlock()
+	// synthState is main-goroutine-only; no mutex needed.
+	c.synthState[connID] = &synthXconnState{
+		ridBase:   newBase,
+		ridMask:   newMask,
+		rootWin:   rootWin,
+		order:     order,
+		colormaps: make(map[uint32]uint32),
+	}
 	go c.synthRelay(connID, xconn, done, order, appSeqNum)
 }
 
+// enableBigRequests sends QueryExtension("BIG-REQUESTS") + BigReqEnable on
+// xconn so that the connection accepts requests larger than 65535×4 bytes.
+// Silently succeeds if the extension is absent.
+func enableBigRequests(xconn net.Conn, order binary.ByteOrder) error {
+	const name = "BIG-REQUESTS"
+	nameLen := len(name) // 12 — already 4-byte aligned, no padding needed
+	reqWords := uint16((4 + 2 + 2 + nameLen) / 4)
+	buf := make([]byte, 4+2+2+nameLen)
+	buf[0] = x11.OpcodeQueryExtension
+	buf[1] = 0
+	order.PutUint16(buf[2:4], reqWords)
+	order.PutUint16(buf[4:6], uint16(nameLen))
+	// buf[6:8] already zero (pad)
+	copy(buf[8:], name)
+	if _, err := xconn.Write(buf); err != nil {
+		return err
+	}
+	var reply [32]byte
+	if _, err := io.ReadFull(xconn, reply[:]); err != nil {
+		return err
+	}
+	if reply[0] != 1 || reply[8] == 0 {
+		return nil // extension absent
+	}
+	majorOpcode := reply[9]
+	enable := [4]byte{majorOpcode, 0}
+	order.PutUint16(enable[2:], 1)
+	if _, err := xconn.Write(enable[:]); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(xconn, reply[:]); err != nil {
+		return err
+	}
+	return nil
+}
+
 // readAndConsumeSetupReply reads and discards one X11 server setup reply from
-// conn, returning the new resource-id-base on success.
-func readAndConsumeSetupReply(conn net.Conn, byteOrderByte byte) (uint32, error) {
+// conn, returning the new resource-id-base, resource-id-mask, and root window.
+func readAndConsumeSetupReply(conn net.Conn, byteOrderByte byte) (ridBase, ridMask, rootWin uint32, err error) {
 	hdr := make([]byte, 8)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return 0, fmt.Errorf("read setup reply header: %w", err)
+	if _, err = io.ReadFull(conn, hdr); err != nil {
+		return 0, 0, 0, fmt.Errorf("read setup reply header: %w", err)
 	}
 	var order binary.ByteOrder = binary.LittleEndian
 	if byteOrderByte == 0x42 {
@@ -402,19 +509,41 @@ func readAndConsumeSetupReply(conn net.Conn, byteOrderByte byte) (uint32, error)
 	if hdr[0] != 1 {
 		// Failed or authenticate — read reason and discard.
 		reasonLen := int(hdr[1])
-		io.ReadFull(conn, make([]byte, reasonLen))
-		return 0, fmt.Errorf("X11 setup rejected (code %d)", hdr[0])
+		io.ReadFull(conn, make([]byte, reasonLen)) //nolint:errcheck
+		return 0, 0, 0, fmt.Errorf("X11 setup rejected (code %d)", hdr[0])
 	}
 	dataLen := int(order.Uint16(hdr[6:8])) * 4
 	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return 0, fmt.Errorf("read setup reply data: %w", err)
+	if _, err = io.ReadFull(conn, data); err != nil {
+		return 0, 0, 0, fmt.Errorf("read setup reply data: %w", err)
 	}
 	if dataLen < 12 {
-		return 0, fmt.Errorf("setup reply data too short")
+		return 0, 0, 0, fmt.Errorf("setup reply data too short")
 	}
-	// resource-id-base is at offset 4 in the additional data (byte 12 overall).
-	return order.Uint32(data[4:8]), nil
+	// Additional data layout:
+	//   [0:4]   release-number
+	//   [4:8]   resource-id-base
+	//   [8:12]  resource-id-mask
+	//   [12:16] motion-buffer-size
+	//   [16:18] vendor-length
+	//   [18:20] max-request-length
+	//   [20]    number-of-screens
+	//   [21]    number-of-formats
+	//   [22:32] image/bitmap format bytes + padding
+	//   [32:]   vendor string (vendor-length bytes, padded to 4)
+	//   [32+pad(vendorLen)+numFormats*8:] first screen (first 4 bytes = root window)
+	ridBase = order.Uint32(data[4:8])
+	ridMask = order.Uint32(data[8:12])
+	if dataLen >= 22 {
+		vendorLen := int(order.Uint16(data[16:18]))
+		numFormats := int(data[21])
+		vendorPadded := (vendorLen + 3) &^ 3
+		screenOff := 32 + vendorPadded + numFormats*8
+		if dataLen >= screenOff+4 {
+			rootWin = order.Uint32(data[screenOff:])
+		}
+	}
+	return ridBase, ridMask, rootWin, nil
 }
 
 func (c *Client) handleX11Data(payload []byte) {
@@ -444,6 +573,15 @@ func (c *Client) handleX11Data(payload []byte) {
 
 	if hasRemap {
 		data = applyIDRemap(data, remap)
+	}
+	// During synthesis, inject a scratch colormap into CreateWindow requests that
+	// have a non-default depth but no CWColormap. The server strips the original
+	// colormap (it belongs to a dead connection), but the X server requires an
+	// explicit colormap for depth != root depth. We create one on the fly.
+	if c.inSynthesis && len(data) >= 32 && data[0] == x11.OpcodeCreateWindow {
+		if state, ok := c.synthState[connID]; ok {
+			data = c.injectColormap(data, state, xconn)
+		}
 	}
 	if _, err := xconn.Write(data); err != nil {
 		log.Println("client: write to display:", err)
@@ -517,6 +655,84 @@ func (c *Client) handleCompressed(msg wire.Msg) {
 //     them to the app), rewriting sequence numbers: new_seq = old_seq + offset,
 //     where offset = uint16(appSeqNum) - N_synth. This keeps the app's Xlib
 //     seq counter consistent as live requests flow through the synthesis conn.
+// injectColormap adds a scratch colormap to a CreateWindow request if it
+// specifies a non-default depth and visual but has no CWColormap in its
+// value-mask. This prevents BadMatch errors when the X server requires an
+// explicit colormap for windows with a non-root depth (e.g., 32-bit ARGB).
+// The scratch colormap is created on xconn and cached by visual in state.
+func (c *Client) injectColormap(data []byte, state *synthXconnState, xconn net.Conn) []byte {
+	if len(data) < 32 || data[0] != x11.OpcodeCreateWindow {
+		return data
+	}
+	depth := data[1]
+	if depth == 0 {
+		return data // CopyFromParent — server picks appropriate colormap
+	}
+	valueMask := state.order.Uint32(data[28:32])
+	if valueMask&(1<<13) != 0 {
+		return data // CWColormap already present
+	}
+	visual := state.order.Uint32(data[24:28])
+	if visual == 0 {
+		return data // CopyFromParent visual
+	}
+
+	cmapID, ok := state.colormaps[visual]
+	if !ok {
+		// Allocate scratch ID from the top of the synthesis xconn's rid range,
+		// counting downward to avoid collisions with synthesised resource IDs
+		// (which start from the low bits of ridMask).
+		cmapID = state.ridBase | (state.ridMask - state.nextScratch)
+		state.nextScratch++
+
+		// CreateColormap: [opcode:1][alloc:1][len:2][cmap:4][window:4][visual:4]
+		buf := make([]byte, 16)
+		buf[0] = x11.OpcodeCreateColormap
+		buf[1] = 0 // alloc=None
+		state.order.PutUint16(buf[2:4], 4)
+		state.order.PutUint32(buf[4:8], cmapID)
+		state.order.PutUint32(buf[8:12], state.rootWin)
+		state.order.PutUint32(buf[12:16], visual)
+		if _, err := xconn.Write(buf); err != nil {
+			log.Printf("client: injectColormap: CreateColormap visual=0x%x: %v", visual, err)
+			return data
+		}
+		state.colormaps[visual] = cmapID
+	}
+	return addColormapToCreateWindow(data, cmapID, state.order)
+}
+
+// addColormapToCreateWindow inserts CWColormap (bit 13) with the given
+// colormap ID into the CreateWindow request's value-list at the correct
+// position, and updates the value-mask and length fields.
+func addColormapToCreateWindow(data []byte, cmapID uint32, order binary.ByteOrder) []byte {
+	if len(data) < 32 {
+		return data
+	}
+	valueMask := order.Uint32(data[28:32])
+
+	// Count set bits below bit 13 to find the insertion index in the value-list.
+	insertPos := 0
+	for bit := uint(0); bit < 13; bit++ {
+		if valueMask&(1<<bit) != 0 {
+			insertPos++
+		}
+	}
+	insertOffset := 32 + insertPos*4
+	if insertOffset > len(data) {
+		return data
+	}
+
+	newData := make([]byte, len(data)+4)
+	copy(newData[:insertOffset], data[:insertOffset])
+	order.PutUint32(newData[insertOffset:], cmapID)
+	copy(newData[insertOffset+4:], data[insertOffset:])
+
+	order.PutUint32(newData[28:32], valueMask|(1<<13))
+	order.PutUint16(newData[2:4], order.Uint16(newData[2:4])+1)
+	return newData
+}
+
 func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{}, order binary.ByteOrder, appSeqNum uint32) {
 	defer func() {
 		xconn.Close()
@@ -561,10 +777,26 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 		}
 	}()
 
+	// Events that arrive during synthesis and barrier phases carry
+	// synthesis-internal sequence numbers. Only FocusIn/FocusOut are worth
+	// replaying: the WM sends FocusIn after MapWindow and losing it means the
+	// app never receives keyboard focus. All other WM management events
+	// (ConfigureNotify, MapNotify, ReparentNotify, Expose, PropertyNotify, …)
+	// are filtered out because they carry display :1 geometry/state that does
+	// not match display :2, and forwarding them corrupts GTK3/GDK internal
+	// state (e.g. ConfigureNotify triggers thaw on a window that was never
+	// frozen, breaking the update-freeze accounting and preventing redraws).
+	var bufferedEvents []synthMsg
+
+	// synthShouldBuffer returns true for events that must survive synthesis.
+	// Only FocusIn (9) and FocusOut (10) qualify; everything else is dropped.
+	synthShouldBuffer := func(evType byte) bool {
+		return evType == 9 || evType == 10
+	}
+
 	// Phase 1: drain until SESSION_LIVE fires. Transition immediately on done
 	// so we do not consume and discard the first live reply (e.g. from an
-	// XSync the app issues in its Expose handler). Buffered synthesis errors/
-	// events are drained in Phase 2 before the GetInputFocus barrier reply.
+	// XSync the app issues in its Expose handler).
 	for {
 		select {
 		case <-done:
@@ -578,20 +810,18 @@ func (c *Client) synthRelay(connID uint32, xconn net.Conn, done <-chan struct{},
 				minor := order.Uint16(m.hdr[8:10])
 				log.Printf("client: synthRelay conn %d: X error during synthesis: code=%d major=%d minor=%d badID=0x%08x",
 					connID, m.hdr[1], m.hdr[10], minor, badID)
+			} else if m.hdr[0] >= 2 && synthShouldBuffer(m.hdr[0]) {
+				bufferedEvents = append(bufferedEvents, m)
 			}
 		}
 	}
 phase2:
 
-	// Phase 2: barrier. Send GetInputFocus so the X server processes it after
-	// all synthesis commands. Drain until we receive its reply, capturing the
-	// reply's sequence number (N_synth) so we can compute the seq offset.
-	barrierReq := [4]byte{x11.OpcodeGetInputFocus, 0}
-	order.PutUint16(barrierReq[2:], 1) // length = 1 unit (4 bytes)
-	if _, err := xconn.Write(barrierReq[:]); err != nil {
-		log.Printf("client: synthRelay conn %d: write GetInputFocus: %v", connID, err)
-		return
-	}
+	// Phase 2: drain until we receive the GetInputFocus barrier reply.
+	// GetInputFocus was already sent by serve() when it processed SESSION_LIVE,
+	// before entering the live message loop — guaranteeing it arrived at the real
+	// X server before any live queries from the app. We just wait for the reply
+	// here; its sequence number (N_synth) lets us compute seqOffset.
 	var nSynth uint16
 	for {
 		m := <-msgs
@@ -602,22 +832,30 @@ phase2:
 			badID := order.Uint32(m.hdr[4:8])
 			log.Printf("client: synthRelay conn %d: X error during barrier: code=%d major=%d badID=0x%08x",
 				connID, m.hdr[1], m.hdr[10], badID)
-		}
-		if m.hdr[0] == 1 {
+		} else if m.hdr[0] == 1 {
 			nSynth = order.Uint16(m.hdr[2:4])
 			break
+		} else if m.hdr[0] >= 2 && synthShouldBuffer(m.hdr[0]) {
+			bufferedEvents = append(bufferedEvents, m)
 		}
 	}
 
 	// Phase 3: forward all messages back to the server with rewritten sequence
 	// numbers. seqOffset maps synthesis-xconn seq space to app seq space so
 	// Xlib on the app side recognises replies to its own requests.
-	seqOffset := uint16(appSeqNum) - nSynth
-	for {
-		m := <-msgs
-		if m.err != nil {
-			return
-		}
+	// Use the FINAL seqNum (updated in MsgSessionLive) which accounts for
+	// requests the app sent during synthesis that were discarded server-side
+	// (never forwarded to the real X server, but still incremented the app's
+	// sequence counter). Using the initial seqNum would leave seqOffset off by
+	// the number of discarded requests, causing all forwarded replies to arrive
+	// with wrong sequence numbers and Xlib matching them to wrong requests.
+	c.mu.Lock()
+	finalSeqNum := c.synthFinalSeqNums[connID]
+	c.mu.Unlock()
+	seqOffset := uint16(finalSeqNum) - nSynth
+
+	// Helper to forward one message with seq rewriting applied.
+	forward := func(m synthMsg) {
 		if m.hdr[0] == 0 {
 			badID := order.Uint32(m.hdr[4:8])
 			minor := order.Uint16(m.hdr[8:10])
@@ -637,6 +875,39 @@ phase2:
 		c.srvW.Lock()
 		wire.WriteX11Data(c.server, connID, full) //nolint:errcheck
 		c.srvW.Unlock()
+	}
+
+	// Replay buffered FocusIn/FocusOut events from synthesis/barrier phases.
+	// We cannot use seqOffset here: synthesis seq numbers after offset map to
+	// values LESS THAN the seq the app last saw before disconnect. XCB in
+	// XInitThreads mode requires non-decreasing sequence numbers and crashes
+	// (xcb_xlib_threads_sequence_lost) on a backwards jump. Stamp all buffered
+	// events with uint16(finalSeqNum) — the watermark at SESSION_LIVE — so the
+	// app sees them as arriving "now". Phase 3 events increment normally after.
+	appSeq16 := uint16(finalSeqNum)
+	for _, m := range bufferedEvents {
+		h := m.hdr
+		order.PutUint16(h[2:4], appSeq16)
+		var full []byte
+		if len(m.tail) > 0 {
+			full = make([]byte, 32+len(m.tail))
+			copy(full, h[:])
+			copy(full[32:], m.tail)
+		} else {
+			full = h[:]
+		}
+		c.srvW.Lock()
+		wire.WriteX11Data(c.server, connID, full) //nolint:errcheck
+		c.srvW.Unlock()
+	}
+	bufferedEvents = nil
+
+	for {
+		m := <-msgs
+		if m.err != nil {
+			return
+		}
+		forward(m)
 	}
 }
 

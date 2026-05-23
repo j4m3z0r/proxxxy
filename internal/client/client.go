@@ -160,6 +160,28 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		remap(4 + s)  // src drawable
 		remap(8 + s)  // dst drawable
 		remap(12 + s) // GC
+	case x11.OpcodeMITSHM:
+		// MIT-SHM extension: minor opcode at byte[1] determines field layout.
+		// ShmAttach/ShmDetach: shmseg at [4]; default remap covers [4] and [8]
+		// but shmid at [8] in ShmAttach is a Unix kernel ID, not an X resource
+		// (its value is outside the app's ridBase range so the check is a no-op).
+		// ShmPutImage (3): drawable[4], gc[8], shmseg[32].
+		// ShmCreatePixmap (5): pixmap[4], drawable[8], shmseg[20].
+		if len(cmd) < 2 {
+			return out
+		}
+		switch cmd[1] {
+		case x11.SHMAttach, x11.SHMDetach:
+			remap(4 + s) // shmseg (ShmAttach: shmid at [8] is NOT a resource ID)
+		default: // ShmPutImage (3), ShmGetImage (4), any future minor
+			remap(4 + s) // drawable
+			remap(8 + s) // gc / drawable
+			remap(32 + s) // shmseg (ShmPutImage layout; ShmGetImage shmseg is at [28])
+		case x11.SHMCreatePixmap: // minor 5
+			remap(4 + s)  // pixmap ID
+			remap(8 + s)  // drawable
+			remap(20 + s) // shmseg
+		}
 	case x11.OpcodeRender:
 		// RENDER extension: minor opcode at byte[1] determines field layout.
 		// We remap Picture IDs and drawable IDs; PictFormat IDs are global

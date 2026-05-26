@@ -174,8 +174,12 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 			cr = sanitizeGCDrawable(cr, gc.Drawable, gc.DrawableDepth, windows, pixmaps, ac.Order)
 			cr = sanitizeGCPixmapAttrs(cr, pixmaps, ac.Order)
 			cr = sanitizeGCFont(cr, fonts, ac.Order)
+			logDrawable := gc.Drawable
+			if ac.Order.Uint32(cr[8:12]) != gc.Drawable {
+				logDrawable = ac.Order.Uint32(cr[8:12]) // substituted
+			}
 			log.Printf("server: synthesis conn %d: CreateGC 0x%08x drawable=0x%08x len=%d",
-				ac.ID, gc.ID, gc.Drawable, len(cr))
+				ac.ID, gc.ID, logDrawable, len(cr))
 			s.sendToClient(ac.ID, cr)
 		}
 		for _, cmd := range gc.ChangeCmds {
@@ -255,6 +259,9 @@ func (s *Server) synthesiseWindowCreate(connID uint32, all map[uint32]x11.Window
 			log.Printf("server: synthesis conn %d: SelectInput 0x%08x mask=0x%08x",
 				connID, w.ID, w.EventMask)
 			s.sendToClient(connID, makeSelectInput(wid, w.EventMask, order))
+		}
+		for _, pcmd := range w.PropertyCmds {
+			s.sendToClient(connID, pcmd)
 		}
 	}
 	for _, child := range w.Children {
@@ -395,10 +402,10 @@ func sanitizeGCDrawable(req []byte, drawable uint32, drawableDepth byte, windows
 	if _, ok := pixmaps[drawable]; ok {
 		return req
 	}
-	// Drawable is gone — substitute with an InputOutput window that preferably
-	// has the same depth as the original drawable. InputOnly windows (class=2)
-	// cannot be used as GC drawables (BadMatch). If the original drawable depth
-	// is unknown (0), accept any InputOutput window.
+	// Drawable is gone — substitute with a drawable of matching depth so that
+	// the GC can still be used without BadMatch errors. Check windows (InputOutput
+	// only) first, then pixmaps (which may carry a non-standard depth like 32-bit
+	// ARGB that no window on the display supports).
 	const classInputOnly = 2
 	var fallbackID uint32
 	for id, w := range windows {
@@ -407,15 +414,23 @@ func sanitizeGCDrawable(req []byte, drawable uint32, drawableDepth byte, windows
 		}
 		if drawableDepth == 0 || w.Depth == drawableDepth || w.Depth == 0 {
 			fallbackID = id
-			// Prefer an exact depth match: keep looking only if this is a
-			// depth-0 (CopyFromParent) match and we haven't found exact yet.
 			if drawableDepth == 0 || w.Depth == drawableDepth {
 				break
 			}
 		}
 	}
+	if fallbackID == 0 && drawableDepth != 0 {
+		// No depth-matched window; try surviving pixmaps (e.g. depth-32 ARGB
+		// pixmaps that have no matching-depth window on the display).
+		for id, pm := range pixmaps {
+			if pm.Depth == drawableDepth {
+				fallbackID = id
+				break
+			}
+		}
+	}
 	if fallbackID == 0 {
-		// No depth-matched InputOutput window; fall back to any non-InputOnly window.
+		// No depth-matched drawable; fall back to any non-InputOnly window.
 		for id, w := range windows {
 			if w.Class != classInputOnly {
 				fallbackID = id

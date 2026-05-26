@@ -149,7 +149,7 @@ send_input() {
             ;;
         gimp)
             local wid
-            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --name "GIMP" 2>/dev/null | head -1 || true)
+            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --class "Gimp" 2>/dev/null | head -1 || true)
             if [[ -n "$wid" ]]; then
                 DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" alt+F
                 sleep 0.3
@@ -179,6 +179,7 @@ fi
 
 # Stage config
 APP_SEARCH="name"
+APP_SETTLE=0  # extra seconds to wait after window appears before starting cycles
 case $STAGE in
     1)
         go build -o "$RESULTS/testclient" "$REPO/cmd/testclient/"
@@ -214,8 +215,14 @@ case $STAGE in
         APP_BIN="gimp"
         APP_ARGS=()
         APP_ENV=(GDK_SYNCHRONIZE=1)
-        APP_WINDOW="GIMP"
+        APP_WINDOW="Gimp"
+        APP_SEARCH="class"
         INPUT_MODE="gimp"
+        # GIMP replaces its splash window with the main window hierarchy a few
+        # seconds after the initial window appears.  Waiting here ensures
+        # synthesis captures a stable, fully-initialized state rather than an
+        # in-progress window replacement.
+        APP_SETTLE=8
         ;;
     *)
         echo "Unknown stage: $STAGE" >&2; exit 1 ;;
@@ -238,6 +245,7 @@ start_app
 
 wait_for_window "$APP_WINDOW"
 sleep 1
+[[ $APP_SETTLE -gt 0 ]] && { log "Settling for ${APP_SETTLE}s..."; sleep "$APP_SETTLE"; }
 screenshot "initial"
 
 PASS=0

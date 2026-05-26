@@ -879,6 +879,14 @@ phase2:
 	// Helper to forward one message with seq rewriting applied.
 	forward := func(m synthMsg) {
 		if m.hdr[0] == 0 {
+			// Discard errors whose seqNum predates or equals the barrier: these are
+			// late-arriving synthesis errors that missed Phase 2 draining. Forwarding
+			// them with the seqOffset applied would map them to a live seqNum, causing
+			// the app to associate the error with one of its own (innocent) requests.
+			seq := order.Uint16(m.hdr[2:4])
+			if seq <= nSynth {
+				return
+			}
 			badID := order.Uint32(m.hdr[4:8])
 			minor := order.Uint16(m.hdr[8:10])
 			log.Printf("client: synthRelay conn %d: X error during live: code=%d major=%d minor=%d badID=0x%08x",

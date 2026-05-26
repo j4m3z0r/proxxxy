@@ -26,13 +26,14 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 RESULTS="$REPO/tests/results/$(date +%Y%m%d-%H%M%S)-stage${STAGE}"
 mkdir -p "$RESULTS"
 
-SERVER_PID="" CLIENT_PID="" APP_PID="" XVFB_PID=""
+SERVER_PID="" CLIENT_PID="" APP_PID="" XVFB_PID="" XCLOCK_ANCHOR_PID=""
 
 cleanup() {
-    [[ -n "${APP_PID:-}" ]]    && kill "$APP_PID"    2>/dev/null || true
-    [[ -n "${CLIENT_PID:-}" ]] && kill "$CLIENT_PID" 2>/dev/null || true
-    [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
-    [[ -n "${XVFB_PID:-}" ]]   && kill "$XVFB_PID"  2>/dev/null || true
+    [[ -n "${APP_PID:-}" ]]           && kill "$APP_PID"           2>/dev/null || true
+    [[ -n "${CLIENT_PID:-}" ]]        && kill "$CLIENT_PID"        2>/dev/null || true
+    [[ -n "${SERVER_PID:-}" ]]        && kill "$SERVER_PID"        2>/dev/null || true
+    [[ -n "${XCLOCK_ANCHOR_PID:-}" ]] && kill "$XCLOCK_ANCHOR_PID" 2>/dev/null || true
+    [[ -n "${XVFB_PID:-}" ]]         && kill "$XVFB_PID"          2>/dev/null || true
     rm -f "/tmp/.X11-unix/X${FAKE_DISP}" "/tmp/.X${FAKE_DISP}-lock"
 }
 trap cleanup EXIT
@@ -48,6 +49,12 @@ log "Starting Xvfb :${REAL_DISP}..."
 Xvfb ":${REAL_DISP}" -screen 0 1920x1080x24 -ac &
 XVFB_PID=$!
 sleep 0.5
+# Anchor client: keeps Xvfb alive (and its atom table intact) across proxxxy-client
+# reconnects.  Without this, Xvfb resets all user-defined atoms the moment its last
+# client disconnects — which happens during each reconnect cycle.  On a real Xorg
+# display the WM/desktop fills this role; in the test environment xclock does it.
+DISPLAY=":${REAL_DISP}" xclock &
+XCLOCK_ANCHOR_PID=$!
 
 start_server() {
     rm -f "/tmp/.X11-unix/X${FAKE_DISP}" "/tmp/.X${FAKE_DISP}-lock"
@@ -67,9 +74,9 @@ start_client() {
 
 wait_for_window() {
     local title="$1" deadline=$((SECONDS + 30))
-    log "Waiting for window: '$title'..."
+    log "Waiting for window: '$title' (search=${APP_SEARCH:-name})..."
     while [[ $SECONDS -lt $deadline ]]; do
-        if DISPLAY=":${REAL_DISP}" xdotool search --name "$title" >/dev/null 2>&1; then
+        if DISPLAY=":${REAL_DISP}" xdotool search "--${APP_SEARCH:-name}" "$title" >/dev/null 2>&1; then
             log "Window found: '$title'"
             return 0
         fi
@@ -103,7 +110,9 @@ screenshot() {
 ERROR_OFFSET=1
 check_new_errors() {
     local errs
+    # Exclude synthesis/barrier-phase errors — they are discarded by synthRelay and don't reach the app.
     errs=$(tail -n "+${ERROR_OFFSET}" "$RESULTS/client.log" 2>/dev/null \
+        | grep -v "X error during synthesis\|X error during barrier" \
         | grep -E "BadWindow|BadMatch|BadFont|BadGC|BadValue|BadRequest|code=[1-9]" || true)
     ERROR_OFFSET=$(( $(wc -l < "$RESULTS/client.log" 2>/dev/null || echo 1) + 1 ))
     printf '%s' "$errs"
@@ -117,7 +126,7 @@ send_input() {
             ;;
         xterm)
             local wid
-            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --name "xterm" 2>/dev/null | head -1 || true)
+            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --class "XTerm" 2>/dev/null | head -1 || true)
             if [[ -n "$wid" ]]; then
                 DISPLAY=":${REAL_DISP}" xdotool type --window "$wid" "echo hello${cycle}"
                 DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" Return
@@ -169,6 +178,7 @@ if [[ $STAGE -eq 5 ]]; then
 fi
 
 # Stage config
+APP_SEARCH="name"
 case $STAGE in
     1)
         go build -o "$RESULTS/testclient" "$REPO/cmd/testclient/"
@@ -189,7 +199,8 @@ case $STAGE in
         APP_BIN="xterm"
         APP_ARGS=(-synchronous)
         APP_ENV=()
-        APP_WINDOW="xterm"
+        APP_WINDOW="XTerm"
+        APP_SEARCH="class"
         INPUT_MODE="xterm"
         ;;
     4)

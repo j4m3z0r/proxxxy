@@ -234,8 +234,8 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 	}
 }
 
-// synthesiseWindowCreate sends CreateWindow for a window and its subtree
-// (without mapping them yet).
+// synthesiseWindowCreate sends CreateWindow (and ChangeWindowAttributes for
+// input masks) for a window and its subtree, without mapping them yet.
 func (s *Server) synthesiseWindowCreate(connID uint32, all map[uint32]x11.Window, wid uint32, order binary.ByteOrder) {
 	w, ok := all[wid]
 	if !ok {
@@ -246,6 +246,16 @@ func (s *Server) synthesiseWindowCreate(connID uint32, all map[uint32]x11.Window
 		log.Printf("server: synthesis conn %d: CreateWindow 0x%08x parent=0x%08x mapped=%v len=%d",
 			connID, w.ID, w.Parent, w.Mapped, len(cr))
 		s.sendToClient(connID, cr)
+		// Replay the app's XSelectInput event mask. GTK3 issues
+		// ChangeWindowAttributes with CWEventMask after CreateWindow to add
+		// ButtonPressMask, KeyPressMask, etc. Without this, the synthesis
+		// xconn window receives no input events from the real X server, so
+		// clicks and keystrokes never reach GIMP after reconnect.
+		if w.EventMask != 0 {
+			log.Printf("server: synthesis conn %d: SelectInput 0x%08x mask=0x%08x",
+				connID, w.ID, w.EventMask)
+			s.sendToClient(connID, makeSelectInput(wid, w.EventMask, order))
+		}
 	}
 	for _, child := range w.Children {
 		s.synthesiseWindowCreate(connID, all, child, order)
@@ -266,17 +276,16 @@ func (s *Server) synthesiseWindowMap(connID uint32, all map[uint32]x11.Window, w
 	}
 }
 
-// synthesisConfigureNotify injects a fake ConfigureNotify for each mapped
-// window. GTK3/GDK tracks a configure_request_count that it increments when
-// it sends ConfigureWindow and decrements on ConfigureNotify. During the
-// client outage, ConfigureWindow requests from the app were discarded by
-// proxxxy, but configure_request_count was still incremented. Without a
-// matching ConfigureNotify, the count stays > 0, which permanently blocks
-// gdk_window_process_updates_with_mode from drawing. We inject one fake
-// ConfigureNotify per window here (before SESSION_LIVE and before injecting
-// Expose) so that any outstanding count is decremented, the frozen window is
-// thawed, and the Expose can trigger a proper redraw.
-func (s *Server) synthesisConfigureNotify(ac *x11.AppConn) {
+// synthesisConfigureNotify injects fake ConfigureNotify events for each mapped
+// window. GTK3/GDK tracks a configure_request_count that it increments when it
+// sends ConfigureWindow and decrements on ConfigureNotify. During the client
+// outage, ConfigureWindow requests from the app were discarded by proxxxy, but
+// configure_request_count was still incremented by N (the number of
+// ConfigureWindow requests sent). Without N matching ConfigureNotify events,
+// the count stays > 0, permanently blocking gdk_window_process_updates_with_mode.
+// pendingCfgs is the per-window count from DrainPendingConfigures; we inject
+// max(1, pendingCfgs[wid]) events so the count reaches zero regardless of N.
+func (s *Server) synthesisConfigureNotify(ac *x11.AppConn, pendingCfgs map[uint32]uint32) {
 	s.mu.Lock()
 	app := s.appConns[ac.ID]
 	s.mu.Unlock()
@@ -288,10 +297,16 @@ func (s *Server) synthesisConfigureNotify(ac *x11.AppConn) {
 		if !w.Mapped || w.Width == 0 || w.Height == 0 {
 			continue
 		}
-		log.Printf("server: synthesis conn %d: injecting ConfigureNotify for 0x%08x %dx%d",
-			ac.ID, w.ID, w.Width, w.Height)
-		evt := makeConfigureNotifyEvent(w.ID, w.X, w.Y, w.Width, w.Height, w.BorderWidth, seqNum, ac.Order)
-		app.Write(evt) //nolint:errcheck
+		count := pendingCfgs[w.ID]
+		if count < 1 {
+			count = 1
+		}
+		log.Printf("server: synthesis conn %d: injecting %d ConfigureNotify(s) for 0x%08x %dx%d",
+			ac.ID, count, w.ID, w.Width, w.Height)
+		for i := uint32(0); i < count; i++ {
+			evt := makeConfigureNotifyEvent(w.ID, w.X, w.Y, w.Width, w.Height, w.BorderWidth, seqNum, ac.Order)
+			app.Write(evt) //nolint:errcheck
+		}
 	}
 }
 
@@ -553,6 +568,19 @@ func findRoots(windows map[uint32]x11.Window) []uint32 {
 	return roots
 }
 
+// makeSelectInput builds a raw ChangeWindowAttributes request that sets only
+// the CWEventMask attribute (bit 11) to the given eventMask value.
+func makeSelectInput(wid uint32, eventMask uint32, order binary.ByteOrder) []byte {
+	req := make([]byte, 16)
+	req[0] = x11.OpcodeChangeWindowAttributes
+	// byte 1: unused pad
+	order.PutUint16(req[2:4], 4) // 4 words = 16 bytes
+	order.PutUint32(req[4:8], wid)
+	order.PutUint32(req[8:12], 1<<11) // CWEventMask only
+	order.PutUint32(req[12:16], eventMask)
+	return req
+}
+
 func makeMapWindow(wid uint32, order binary.ByteOrder) []byte {
 	req := make([]byte, 8)
 	req[0] = x11.OpcodeMapWindow
@@ -639,6 +667,13 @@ func (s *Server) runSynthesis() {
 	}
 	s.mu.Unlock()
 
+	// Reset pending-configure counts before synthesis so DrainPendingConfigures
+	// later returns only ConfigureWindow requests from this reconnect window
+	// (not counts accumulated during normal operation where they were balanced).
+	for _, ac := range states {
+		ac.ResetPendingConfigures()
+	}
+
 	for _, ac := range states {
 		wins := ac.Windows()
 		gcs := ac.GCs()
@@ -661,6 +696,7 @@ func (s *Server) runSynthesis() {
 		binary.LittleEndian.PutUint32(livePayload[4+i*8:], ac.ID)
 		binary.LittleEndian.PutUint32(livePayload[8+i*8:], ac.SeqNum())
 	}
+	log.Printf("server: synthesis complete, sending SESSION_LIVE for %d conns", len(states))
 	s.WriteToClient(wire.MsgSessionLive, livePayload)
 
 	// Clear live-relay block BEFORE injecting events. Draw commands triggered by
@@ -670,12 +706,13 @@ func (s *Server) runSynthesis() {
 	s.mu.Unlock()
 
 	for _, ac := range states {
-		// Inject ConfigureNotify first: during the outage, the app may have sent
-		// ConfigureWindow requests that were discarded (no client), leaving
-		// GTK3's configure_request_count > 0 with a matching freeze. A fake
-		// ConfigureNotify decrements the count and thaws the window so the
-		// subsequent Expose can trigger a proper redraw.
-		s.synthesisConfigureNotify(ac)
+		// Drain pending configure counts and inject exactly that many
+		// ConfigureNotify events. During the outage, the app may have sent N
+		// ConfigureWindow requests; GTK3 increments configure_request_count by N
+		// and only decrements on ConfigureNotify. Injecting fewer than N leaves
+		// the count > 0 and permanently blocks drawing.
+		pendingCfgs := ac.DrainPendingConfigures()
+		s.synthesisConfigureNotify(ac, pendingCfgs)
 		s.synthesisExpose(ac)
 	}
 }

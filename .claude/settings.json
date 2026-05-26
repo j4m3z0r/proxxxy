@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gdb": {
+      "command": "/home/james/src/proxxxy/.venv/bin/python",
+      "args": ["/home/james/.local/mdb-mcp/server.py"]
+    }
+  }
+}

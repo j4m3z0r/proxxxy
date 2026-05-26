@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -167,13 +168,54 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 			out += int64(len(m.Payload))
 		}
 		enc.Stats.BytesOut.Add(out)
-		s.sendMsgsToClient(msgs)
+		if !s.sendMsgsToClient(msgs) {
+			// Dropped — no client or synthesis active. Send fake events so
+			// app threads don't deadlock or hang:
+			//   - OpcodeNeedsReply: fake zero-data success reply unblocks XLib
+			//   - ShmPutImage+send_event: fake ShmCompletion unblocks SWGL
+			// Fire during both full disconnect (c==nil) AND synthesis active,
+			// since in both cases live requests are dropped and no real reply
+			// will arrive from the X server.
+			s.mu.Lock()
+			shouldFake := s.clientConn == nil || s.synthActive
+			s.mu.Unlock()
+			if shouldFake {
+				for _, m := range msgs {
+					if m.Type != wire.MsgX11Data || len(m.Payload) < 5 {
+						continue
+					}
+					opcode := m.Payload[4] // [conn_id:4][opcode:1][...]
+					if x11.OpcodeNeedsReply(opcode) {
+						seq := uint16(ac.SeqNum())
+						log.Printf("server: conn %d: no client, fake reply opcode=%d seq=%d",
+							ac.ID, opcode, seq)
+						sendFakeX11Reply(app, seq, ac.Order)
+					}
+					// MIT-SHM ShmPutImage with send_event=True: send a fake
+					// ShmCompletion so Firefox's SWGL compositor does not hang
+					// waiting for an event that Xvfb will never generate (the
+					// request was dropped because there is no client to relay it).
+					if opcode == shmMajorOpcode && len(m.Payload) >= 44 &&
+						m.Payload[5] == shmPutImageMinor && m.Payload[34] != 0 {
+						drawable := ac.Order.Uint32(m.Payload[8:12])
+						shmseg := ac.Order.Uint32(m.Payload[36:40])
+						offset := ac.Order.Uint32(m.Payload[40:44])
+						seq := uint16(ac.SeqNum())
+						log.Printf("server: conn %d: no client, fake ShmCompletion seq=%d drawable=0x%x shmseg=0x%x",
+							ac.ID, seq, drawable, shmseg)
+						sendFakeShmCompletion(app, seq, drawable, shmseg, offset, ac.Order)
+					}
+				}
+			}
+		}
 	})
 }
 
-func (s *Server) sendMsgsToClient(msgs []wire.Msg) {
+// sendMsgsToClient forwards msgs to the current proxxxy-client if one is
+// connected and synthesis is not active. Returns false if msgs were discarded.
+func (s *Server) sendMsgsToClient(msgs []wire.Msg) bool {
 	if len(msgs) == 0 {
-		return
+		return true
 	}
 	s.mu.Lock()
 	c := s.clientConn
@@ -182,16 +224,55 @@ func (s *Server) sendMsgsToClient(msgs []wire.Msg) {
 	if c == nil || synth {
 		// No client, or synthesis in progress — live traffic discarded. Apps
 		// will redraw after the Expose injection that follows SESSION_LIVE.
-		return
+		return false
 	}
 	s.clientW.Lock()
 	defer s.clientW.Unlock()
 	for _, msg := range msgs {
 		if err := wire.Write(c, msg.Type, msg.Payload); err != nil {
 			log.Println("server: write to client:", err)
-			return
+			return false
 		}
 	}
+	return true
+}
+
+// shmMajorOpcode is the MIT-SHM extension opcode on Xvfb (always 130).
+// shmEventBase is the first event code for MIT-SHM on Xvfb (always 65).
+// shmPutImageMinor is the minor opcode for ShmPutImage within MIT-SHM.
+// These values are stable for Xvfb; a future improvement would track them
+// dynamically from QueryExtension replies.
+const (
+	shmMajorOpcode   = 130
+	shmEventBase     = 65
+	shmPutImageMinor = 3
+)
+
+// sendFakeShmCompletion writes a synthesized ShmCompletion event to app.
+// Prevents Firefox's SWGL compositor from hanging when ShmPutImage is dropped.
+func sendFakeShmCompletion(app net.Conn, seqNum uint16, drawable, shmseg, offset uint32, order binary.ByteOrder) {
+	var evt [32]byte
+	evt[0] = shmEventBase // ShmCompletion event type (firstEvent + 0)
+	evt[1] = 0
+	order.PutUint16(evt[2:4], seqNum)
+	order.PutUint32(evt[4:8], drawable)
+	order.PutUint16(evt[8:10], shmPutImageMinor) // minor_event = X_ShmPutImage
+	evt[10] = shmMajorOpcode                     // major_event = SHM extension opcode
+	evt[11] = 0
+	order.PutUint32(evt[12:16], shmseg)
+	order.PutUint32(evt[16:20], offset)
+	// bytes 20-31: pad (zero)
+	app.Write(evt[:]) //nolint:errcheck
+}
+
+// sendFakeX11Reply writes a zero-data X11 success reply to app with the given
+// 16-bit sequence number. This unblocks an XLib thread waiting for a reply to
+// a request sent during a client-disconnect window.
+func sendFakeX11Reply(app net.Conn, seqNum uint16, order binary.ByteOrder) {
+	var reply [32]byte
+	reply[0] = 1 // reply indicator
+	order.PutUint16(reply[2:4], seqNum)
+	app.Write(reply[:]) //nolint:errcheck
 }
 
 func (s *Server) sendToClient(connID uint32, data []byte) {

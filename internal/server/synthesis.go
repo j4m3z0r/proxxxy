@@ -84,33 +84,26 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		}
 	}
 
-	// 2.1. SHM pixmaps: recreate as regular pixmaps with the same ID, depth, and
-	//      dimensions. SHM memory can't cross connections, but the pixmap resource
-	//      ID must exist so that GCs and Pictures created on it can be synthesised.
-	//      Content will be repainted by the app's Expose-triggered redraw.
+	// 2.1. SHM pixmaps: replay the original ShmCreatePixmap requests.
+	//      The shmseg IDs were reattached in step 3; the drawable IDs were
+	//      synthesised in steps 5-6. Sending the raw request preserves the
+	//      SHM-backed property that some apps (e.g. Firefox's SWGL renderer)
+	//      need in order to map the framebuffer directly via the kernel SHM
+	//      segment. The pixmaps are already tracked in the pixmaps map (via
+	//      AppConn.Pixmaps, which includes SHM pixmaps from state.go).
 	{
 		shmPMs := ac.ShmPixmaps()
-		// Pick any window as drawable (needed to identify the screen).
-		var drawableWin uint32
-		for id := range windows {
-			drawableWin = id
-			break
-		}
 		for pid, req := range shmPMs {
+			if len(req) < 28 {
+				continue
+			}
 			depth := req[16]
 			width := ac.Order.Uint16(req[12:14])
 			height := ac.Order.Uint16(req[14:16])
-			log.Printf("server: synthesis conn %d: CreatePixmap(shm) 0x%08x %dx%d depth=%d",
-				ac.ID, pid, width, height, depth)
-			cr := make([]byte, 16)
-			cr[0] = x11.OpcodeCreatePixmap
-			cr[1] = depth
-			ac.Order.PutUint16(cr[2:4], 4) // 4 words = 16 bytes
-			ac.Order.PutUint32(cr[4:8], pid)
-			ac.Order.PutUint32(cr[8:12], drawableWin)
-			ac.Order.PutUint16(cr[12:14], width)
-			ac.Order.PutUint16(cr[14:16], height)
-			s.sendToClient(ac.ID, cr)
+			shmseg := ac.Order.Uint32(req[20:24])
+			log.Printf("server: synthesis conn %d: ShmCreatePixmap 0x%08x %dx%d depth=%d shmseg=0x%08x",
+				ac.ID, pid, width, height, depth, shmseg)
+			s.sendToClient(ac.ID, req)
 		}
 	}
 
@@ -123,13 +116,17 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 		}
 	}
 
-	// 2.6. Cursors: create after pixmaps and fonts (CreateCursor uses pixmaps;
-	// CreateGlyphCursor uses fonts). For CreateGlyphCursor, if the source font was
-	// closed after the cursor was created, reopen it temporarily so CreateGlyphCursor
-	// succeeds, then close it again — the cursor resource remains valid after the font
-	// closes, just as it did in the original session.
+	// 2.6. Core cursors: create after pixmaps and fonts (CreateCursor uses pixmaps;
+	// CreateGlyphCursor uses fonts). RenderCreateCursor cursors are deferred to
+	// step 4c after RENDER Pictures, since they reference Picture IDs.
 	for _, cur := range ac.Cursors() {
 		cr := cur.CreateReq()
+		if len(cr) < 12 {
+			continue
+		}
+		if cr[0] == x11.OpcodeRender {
+			continue // RENDER cursor — handled in step 4c
+		}
 		if len(cr) < 16 {
 			continue
 		}
@@ -260,7 +257,8 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 
 	// 4. RENDER Pictures: recreate before pixmap draw commands, since those
 	//    may reference picture objects via RENDER draw calls.
-	for _, pic := range ac.Pictures() {
+	pictures := ac.Pictures()
+	for _, pic := range pictures {
 		if cr := pic.CreateReq(); len(cr) > 0 {
 			log.Printf("server: synthesis conn %d: CreatePicture 0x%08x drawable=0x%08x",
 				ac.ID, pic.ID, pic.Drawable)
@@ -284,6 +282,63 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 				s.sendToClient(ac.ID, cmd)
 			}
 		}
+	}
+
+	// 4c. RENDER cursors: create after Pictures (RenderCreateCursor references a
+	//     source Picture; the cursor ID is in the core cursor namespace and freed
+	//     with the core FreeCursor request).
+	// Firefox creates a pixmap-backed picture, creates the cursor from it, then
+	// frees both immediately. By synthesis time the pixmap is gone, so recreating
+	// the picture fails with BadDrawable. In that case we fall back to a glyph
+	// cursor from the standard "cursor" font so the cursor ID exists in the
+	// synthesis xconn (avoiding BadCursor in live traffic). The cursor won't look
+	// right but won't crash.
+	for _, cur := range ac.Cursors() {
+		cr := cur.CreateReq()
+		if len(cr) < 12 || cr[0] != x11.OpcodeRender || cr[1] != x11.RenderCreateCursor {
+			continue
+		}
+		srcPic := ac.Order.Uint32(cr[8:12])
+		if _, ok := pictures[srcPic]; ok {
+			log.Printf("server: synthesis conn %d: RenderCreateCursor 0x%08x src_picture=0x%08x",
+				ac.ID, cur.ID, srcPic)
+			s.sendToClient(ac.ID, cr)
+			continue
+		}
+		// Source picture absent. Try recreating it from the saved create request.
+		// This works if the picture was a solid-fill/gradient (no backing drawable).
+		// If the picture was backed by a pixmap that is now freed, fall back to a
+		// glyph cursor.
+		picReq := cur.RenderPicReq()
+		if len(picReq) >= 12 && picReq[1] == x11.RenderCreatePicture {
+			// Check that the backing drawable is still alive.
+			drawable := ac.Order.Uint32(picReq[8:12])
+			_, pmOK := pixmaps[drawable]
+			_, winOK := windows[drawable]
+			if !pmOK && !winOK {
+				// Drawable gone — use glyph cursor fallback.
+				tmpFontID := ridBase | scratchCounter
+				scratchCounter--
+				log.Printf("server: synthesis conn %d: RenderCreateCursor 0x%08x fallback glyph cursor (drawable 0x%08x gone)",
+					ac.ID, cur.ID, drawable)
+				s.sendToClient(ac.ID, makeOpenFont(tmpFontID, "cursor", ac.Order))
+				s.sendToClient(ac.ID, makeCreateGlyphCursor(cur.ID, tmpFontID, ac.Order))
+				s.sendToClient(ac.ID, makeCloseFont(tmpFontID, ac.Order))
+				continue
+			}
+		}
+		if len(picReq) == 0 {
+			log.Printf("server: synthesis conn %d: skip RenderCreateCursor 0x%08x (source picture 0x%08x gone, no saved req)",
+				ac.ID, cur.ID, srcPic)
+			continue
+		}
+		log.Printf("server: synthesis conn %d: recreate source picture 0x%08x for cursor 0x%08x",
+			ac.ID, srcPic, cur.ID)
+		s.sendToClient(ac.ID, picReq)
+		log.Printf("server: synthesis conn %d: RenderCreateCursor 0x%08x src_picture=0x%08x",
+			ac.ID, cur.ID, srcPic)
+		s.sendToClient(ac.ID, cr)
+		s.sendToClient(ac.ID, makeFreePicture(srcPic, ac.Order))
 	}
 
 	// 5. Pixmap draw commands: replay after GCs and Pictures exist.
@@ -421,6 +476,29 @@ func (s *Server) synthesisExpose(ac *x11.AppConn) {
 			ac.ID, w.ID, w.Width, w.Height)
 		evt := makeExposeEvent(w.ID, w.Width, w.Height, seqNum, ac.Order)
 		app.Write(evt) //nolint:errcheck
+	}
+}
+
+// synthesisInjectShmCompletions sends a fake ShmCompletion event for every
+// SHM segment currently attached by the app connection. This unblocks an SWGL
+// compositor that is stuck waiting for a ShmCompletion that the previous
+// proxxxy-client dropped when it was killed.
+func (s *Server) synthesisInjectShmCompletions(ac *x11.AppConn) {
+	s.mu.Lock()
+	app := s.appConns[ac.ID]
+	s.mu.Unlock()
+	if app == nil {
+		return
+	}
+	segs := ac.ShmSegs()
+	if len(segs) == 0 {
+		return
+	}
+	seqNum := uint16(ac.SeqNum())
+	for seg := range segs {
+		log.Printf("server: synthesis conn %d: injecting ShmCompletion shmseg=0x%08x",
+			ac.ID, seg)
+		sendFakeShmCompletion(app, seqNum, 0, seg, 0, ac.Order)
 	}
 }
 
@@ -704,6 +782,38 @@ func makeOpenFont(fid uint32, name string, order binary.ByteOrder) []byte {
 	return req
 }
 
+// makeCreateGlyphCursor builds a CreateGlyphCursor request that creates a
+// fallback arrow cursor (XC_arrow = char 2 from the "cursor" font). Used when
+// the original RENDER cursor's source pixmap is gone and we need any valid
+// cursor at the correct resource ID to prevent BadCursor errors in live traffic.
+// Layout: [94:1][pad:1][len:2][cid:4][src-font:4][mask-font:4][src-char:2][mask-char:2]
+//         [fore-r:2][fore-g:2][fore-b:2][back-r:2][back-g:2][back-b:2] = 32 bytes
+func makeCreateGlyphCursor(cid, fontID uint32, order binary.ByteOrder) []byte {
+	req := make([]byte, 32)
+	req[0] = x11.OpcodeCreateGlyphCursor
+	order.PutUint16(req[2:4], 8) // 8 * 4 = 32 bytes
+	order.PutUint32(req[4:8], cid)
+	order.PutUint32(req[8:12], fontID)  // src-font
+	order.PutUint32(req[12:16], fontID) // mask-font
+	order.PutUint16(req[16:18], 2)      // XC_arrow source char
+	order.PutUint16(req[18:20], 3)      // XC_arrow mask char
+	// foreground black: [20:26] = 0
+	order.PutUint16(req[26:28], 65535) // back-red
+	order.PutUint16(req[28:30], 65535) // back-green
+	order.PutUint16(req[30:32], 65535) // back-blue
+	return req
+}
+
+// makeFreePicture builds a raw RENDER FreePicture request for the given picture ID.
+func makeFreePicture(pid uint32, order binary.ByteOrder) []byte {
+	req := make([]byte, 8)
+	req[0] = x11.OpcodeRender
+	req[1] = x11.RenderFreePicture
+	order.PutUint16(req[2:], 2)
+	order.PutUint32(req[4:], pid)
+	return req
+}
+
 // makeCloseFont builds a raw X11 CloseFont request for the given font ID.
 func makeCloseFont(fid uint32, order binary.ByteOrder) []byte {
 	req := make([]byte, 8)
@@ -805,6 +915,14 @@ func (s *Server) runSynthesis() {
 	s.mu.Lock()
 	s.synthActive = false
 	s.mu.Unlock()
+
+	// Inject fake ShmCompletion for every known SHM segment. If the previous
+	// proxxxy-client was killed between Xvfb processing a ShmPutImage and
+	// forwarding the resulting ShmCompletion event, the app's SWGL compositor
+	// is stuck waiting. The fake event unblocks it so it can resume rendering.
+	for _, ac := range states {
+		s.synthesisInjectShmCompletions(ac)
+	}
 
 	for _, ac := range states {
 		// Drain pending configure counts and inject exactly that many

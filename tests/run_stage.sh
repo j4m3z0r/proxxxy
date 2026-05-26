@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # E2E reconnect harness for proxxxy.
 # Usage: tests/run_stage.sh --stage N [--reconnects N] [--display N]
-# Stages: 1=testclient 2=xclock 3=xterm 4=mousepad 5=gimp-baseline 6=gimp
+# Stages: 1=testclient 2=xclock 3=xterm 4=mousepad 5=gimp-baseline 6=gimp 7=firefox 8=chromium 9=libreoffice
 # Requirements: Xvfb, scrot, xdotool in PATH.
 
 set -euo pipefail
@@ -30,6 +30,10 @@ SERVER_PID="" CLIENT_PID="" APP_PID="" XVFB_PID="" XCLOCK_ANCHOR_PID=""
 
 cleanup() {
     [[ -n "${APP_PID:-}" ]]           && kill "$APP_PID"           2>/dev/null || true
+    # LibreOffice spawns soffice.bin as a separate process; kill it explicitly.
+    [[ "${STAGE:-0}" -eq 9 ]]         && pkill -x soffice.bin      2>/dev/null || true
+    # Firefox leaves .parentlock on kill; remove it so the next run starts cleanly.
+    [[ "${STAGE:-0}" -eq 7 ]]         && find "$HOME/.mozilla/firefox" -name ".parentlock" -delete 2>/dev/null || true
     [[ -n "${CLIENT_PID:-}" ]]        && kill "$CLIENT_PID"        2>/dev/null || true
     [[ -n "${SERVER_PID:-}" ]]        && kill "$SERVER_PID"        2>/dev/null || true
     [[ -n "${XCLOCK_ANCHOR_PID:-}" ]] && kill "$XCLOCK_ANCHOR_PID" 2>/dev/null || true
@@ -187,6 +191,103 @@ send_input() {
                 log "  GIMP main window not found for input"
             fi
             ;;
+        firefox|chromium)
+            local app_class
+            local wid wx wy ww wh max_area=0 w geom gx gy gw gh ga
+            [[ "$mode" == "firefox" ]] && app_class="firefox-esr" || app_class="Chromium"
+            # Find the main browser window as the largest of its class.
+            for w in $(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible --class "$app_class" 2>/dev/null || true); do
+                geom=$(DISPLAY=":${REAL_DISP}" xdotool getwindowgeometry --shell "$w" 2>/dev/null || true)
+                gw=$(echo "$geom" | grep '^WIDTH='  | cut -d= -f2)
+                gh=$(echo "$geom" | grep '^HEIGHT=' | cut -d= -f2)
+                ga=$(( ${gw:-0} * ${gh:-0} ))
+                if [[ $ga -gt $max_area ]]; then
+                    max_area=$ga; wid=$w; ww=${gw:-0}; wh=${gh:-0}
+                    gx=$(echo "$geom" | grep '^X=' | cut -d= -f2)
+                    gy=$(echo "$geom" | grep '^Y=' | cut -d= -f2)
+                    wx=${gx:-0}; wy=${gy:-0}
+                fi
+            done
+            if [[ -n "$wid" ]]; then
+                local before_title after_title
+                before_title=$(DISPLAY=":${REAL_DISP}" xdotool getwindowname "$wid" 2>/dev/null || true)
+                log "  DEBUG browser send_input: cycle=${cycle} class=${app_class} wid=${wid} ${ww}x${wh}+${wx}+${wy} title='${before_title}'"
+                # Focus the window explicitly on the real display.
+                DISPLAY=":${REAL_DISP}" xdotool mousemove --sync "$((wx + ww/2))" "$((wy + wh/2))"
+                DISPLAY=":${REAL_DISP}" xdotool click 1
+                sleep 0.3
+                DISPLAY=":${REAL_DISP}" xdotool windowfocus --sync "$wid"
+                # Navigate to a URL with a distinct title via the address bar.
+                # Choose a target URL whose title will differ from before_title so
+                # a same-URL re-navigation never falsely appears as "no change".
+                local nav_url
+                if [[ "$before_title" == *"About About"* ]]; then
+                    nav_url="about:blank"
+                else
+                    nav_url="about:about"
+                fi
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" ctrl+l
+                sleep 0.5
+                DISPLAY=":${REAL_DISP}" xdotool type --window "$wid" --clearmodifiers "$nav_url"
+                sleep 0.3
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" Return
+                # Poll up to 15s for the title to change.
+                local deadline=$((SECONDS + 15))
+                after_title="$before_title"
+                while [[ $SECONDS -lt $deadline && "$after_title" == "$before_title" ]]; do
+                    sleep 0.5
+                    after_title=$(DISPLAY=":${REAL_DISP}" xdotool getwindowname "$wid" 2>/dev/null || true)
+                done
+                if [[ "$after_title" == "$before_title" ]]; then
+                    fail "cycle ${cycle}: ${app_class} URL navigation did not change title ('${before_title}'; keyboard routing failure)"
+                fi
+                log "  browser title changed: '${before_title}' → '${after_title}'"
+            else
+                log "  ${app_class} main window not found for input"
+            fi
+            ;;
+        libreoffice)
+            local wid wx wy ww wh before_n after_n
+            local max_area=0 w geom gx gy gw gh ga
+            # Find the main LibreOffice Writer window as the largest libreoffice-writer window.
+            for w in $(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible --class "libreoffice-writer" 2>/dev/null || true); do
+                geom=$(DISPLAY=":${REAL_DISP}" xdotool getwindowgeometry --shell "$w" 2>/dev/null || true)
+                gw=$(echo "$geom" | grep '^WIDTH='  | cut -d= -f2)
+                gh=$(echo "$geom" | grep '^HEIGHT=' | cut -d= -f2)
+                ga=$(( ${gw:-0} * ${gh:-0} ))
+                if [[ $ga -gt $max_area ]]; then
+                    max_area=$ga; wid=$w; ww=${gw:-0}; wh=${gh:-0}
+                    gx=$(echo "$geom" | grep '^X=' | cut -d= -f2)
+                    gy=$(echo "$geom" | grep '^Y=' | cut -d= -f2)
+                    wx=${gx:-0}; wy=${gy:-0}
+                fi
+            done
+            if [[ -n "$wid" ]]; then
+                # Count all visible windows to detect menu popup creation.
+                # VCL popup menus map a pre-existing (unmapped) X window, so
+                # --onlyvisible catches the transition.
+                before_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible 2>/dev/null | wc -l)
+                log "  DEBUG libreoffice send_input: cycle=${cycle} wid=${wid} ${ww}x${wh}+${wx}+${wy} before_n=${before_n}"
+                # Click in the document editing area and type text.
+                DISPLAY=":${REAL_DISP}" xdotool mousemove --sync "$((wx + ww/2))" "$((wy + wh*2/3))"
+                DISPLAY=":${REAL_DISP}" xdotool click 1
+                sleep 0.2
+                DISPLAY=":${REAL_DISP}" xdotool type "hello${cycle}"
+                DISPLAY=":${REAL_DISP}" xdotool key Return
+                sleep 0.3
+                # Open Format menu via XTest to verify keyboard event routing.
+                DISPLAY=":${REAL_DISP}" xdotool key alt+F
+                sleep 2
+                after_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible 2>/dev/null | wc -l)
+                if [[ $after_n -le $before_n ]]; then
+                    fail "cycle ${cycle}: LibreOffice menu did not open (window count: ${before_n} → ${after_n}; keyboard routing failure)"
+                fi
+                DISPLAY=":${REAL_DISP}" xdotool key Escape
+                sleep 0.3
+            else
+                log "  LibreOffice Writer window not found for input"
+            fi
+            ;;
     esac
 }
 
@@ -207,7 +308,8 @@ fi
 
 # Stage config
 APP_SEARCH="name"
-APP_SETTLE=0  # extra seconds to wait after window appears before starting cycles
+APP_SETTLE=0            # extra seconds after window appears before first cycle
+POST_RECONNECT_SETTLE=0 # extra seconds after synthesis before taking post-reconnect screenshot
 case $STAGE in
     1)
         go build -o "$RESULTS/testclient" "$REPO/cmd/testclient/"
@@ -250,6 +352,41 @@ case $STAGE in
         # seconds after the initial window appears.  Waiting here ensures
         # synthesis captures a stable, fully-initialized state rather than an
         # in-progress window replacement.
+        APP_SETTLE=8
+        ;;
+    7)
+        # Kill any stale .parentlock files left by a previously killed Firefox
+        # instance so the new run doesn't hit the "profile cannot be loaded" dialog.
+        find "$HOME/.mozilla/firefox" -name ".parentlock" -delete 2>/dev/null || true
+        APP_BIN="firefox"
+        APP_ARGS=(--no-remote http://example.com)
+        APP_ENV=(GDK_SYNCHRONIZE=1)
+        APP_WINDOW="firefox-esr"
+        APP_SEARCH="class"
+        INPUT_MODE="firefox"
+        APP_SETTLE=15
+        POST_RECONNECT_SETTLE=20
+        ;;
+    8)
+        APP_BIN="chromium"
+        # --user-data-dir: isolated per-run profile.  --no-sandbox: required in
+        # virtualized environments without user namespaces.
+        APP_ARGS=(--user-data-dir="$RESULTS/cr-profile" --no-sandbox --disable-gpu
+                  --no-first-run --disable-extensions --disable-sync
+                  http://example.com)
+        APP_ENV=()
+        APP_WINDOW="Chromium"
+        APP_SEARCH="class"
+        INPUT_MODE="chromium"
+        APP_SETTLE=15
+        ;;
+    9)
+        APP_BIN="libreoffice"
+        APP_ARGS=(--writer --norestore --nologo)
+        APP_ENV=(GDK_SYNCHRONIZE=1 SAL_USE_VCLPLUGIN=gtk3)
+        APP_WINDOW="libreoffice-writer"
+        APP_SEARCH="class"
+        INPUT_MODE="libreoffice"
         APP_SETTLE=8
         ;;
     *)
@@ -305,6 +442,10 @@ for CYCLE in $(seq 1 "$RECONNECTS"); do
     wait_for_synthesis "$SYNTH_START"
     wait_for_window "$APP_WINDOW"
     sleep 0.5
+    if [[ $POST_RECONNECT_SETTLE -gt 0 ]]; then
+        log "Post-reconnect settle: ${POST_RECONNECT_SETTLE}s..."
+        sleep "$POST_RECONNECT_SETTLE"
+    fi
 
     # Verify input works after reconnect — exercises synthesis correctness.
     screenshot "cycle-${CYCLE}-post-reconnect"

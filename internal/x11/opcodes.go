@@ -142,6 +142,7 @@ const (
 	RenderCompositeGlyphs16         = 24
 	RenderCompositeGlyphs32         = 25
 	RenderFillRectangles            = 26
+	RenderCreateCursor              = 27
 	RenderSetPictureTransform       = 28
 	RenderSetPictureFilter          = 30
 	// Picture constructors without a backing drawable (RENDER protocol v0.7+).

@@ -241,6 +241,10 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		// FillRectangles: [op:1][pad:3][dst:4][color:8][rects…]
 		case x11.RenderFillRectangles:
 			remap(8 + s) // dst picture
+		// CreateCursor: [major:1][27:1][len:2][cid:4][source_picture:4][x:2][y:2]
+		case x11.RenderCreateCursor:
+			remap(4 + s) // cursor ID (cid)
+			remap(8 + s) // source picture
 		}
 	default:
 		// Draw commands and anything else: drawable at [4], GC at [8].

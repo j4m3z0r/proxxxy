@@ -59,6 +59,7 @@ type Cursor struct {
 	ID          uint32
 	createReq   []byte // raw CreateCursor or CreateGlyphCursor request
 	srcFontName string // for CreateGlyphCursor: name of source font at creation time
+	renderPicReq []byte // for RenderCreateCursor: saved source picture create request
 }
 
 // CreateReq returns the raw cursor-creation request bytes.
@@ -67,6 +68,11 @@ func (c Cursor) CreateReq() []byte { return c.createReq }
 // SrcFontName returns the name of the source font used by CreateGlyphCursor
 // (empty string for CreateCursor or if the font name was not available).
 func (c Cursor) SrcFontName() string { return c.srcFontName }
+
+// RenderPicReq returns the saved source picture creation request for
+// RenderCreateCursor cursors (empty for core cursors). Used during synthesis
+// to recreate the source picture when it has already been freed.
+func (c Cursor) RenderPicReq() []byte { return c.renderPicReq }
 
 // Picture represents a RENDER extension Picture resource.
 type Picture struct {
@@ -742,6 +748,24 @@ func (a *AppConn) handleRender(req []byte) {
 			copy(cp, req)
 			gs.AddGlyphsCmds = append(gs.AddGlyphsCmds, cp)
 		}
+	case RenderCreateCursor:
+		// Layout: [139:1][27:1][len:2][cid:4][source_picture:4][x:2][y:2] = 12 bytes
+		if len(req) < 12 {
+			return
+		}
+		cid := a.Order.Uint32(req[4:8])
+		srcPicID := a.Order.Uint32(req[8:12])
+		cp := make([]byte, len(req))
+		copy(cp, req)
+		cur := &Cursor{ID: cid, createReq: cp}
+		// Save the source picture's create request so synthesis can recreate it
+		// temporarily (Firefox frees the picture immediately after cursor creation).
+		if pic, ok := a.pictures[srcPicID]; ok {
+			if picReq := pic.CreateReq(); len(picReq) > 0 {
+				cur.renderPicReq = picReq
+			}
+		}
+		a.cursors[cid] = cur
 	}
 }
 
@@ -916,5 +940,45 @@ func removeID(s []uint32, id uint32) []uint32 {
 		}
 	}
 	return out
+}
+
+// OpcodeNeedsReply reports whether the X11 core-protocol opcode expects a
+// synchronous reply from the server. Extension opcodes (≥128) are not covered;
+// callers should not inject fake replies for those.
+func OpcodeNeedsReply(opcode byte) bool {
+	switch opcode {
+	case
+		3,   // GetWindowAttributes
+		14,  // GetGeometry
+		15,  // QueryTree
+		16,  // InternAtom
+		17,  // GetAtomName
+		20,  // GetProperty
+		23,  // GetSelectionOwner
+		26,  // GrabPointer
+		28,  // GrabKeyboard
+		34,  // GetMotionEvents
+		38,  // TranslateCoordinates
+		43,  // GetInputFocus
+		44,  // QueryKeymap
+		47,  // QueryFont
+		49,  // QueryTextExtents
+		50,  // ListFonts
+		51,  // ListFontsWithInfo
+		52,  // GetFontPath
+		60,  // GetImage
+		73,  // QueryBestSize
+		98,  // QueryExtension
+		99,  // ListExtensions
+		101, // GetKeyboardMapping
+		103, // GetKeyboardControl
+		106, // GetPointerControl
+		108, // GetScreenSaver
+		110, // ListHosts
+		116, // GetPointerMapping
+		117: // GetModifierMapping
+		return true
+	}
+	return false
 }
 

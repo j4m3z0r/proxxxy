@@ -50,12 +50,12 @@ func main() {
 	}
 
 	// WM_DELETE_WINDOW
-	wmProto, err := xproto.InternAtom(X, true, uint16(len("WM_PROTOCOLS")), "WM_PROTOCOLS").Reply()
+	wmProto, err := xproto.InternAtom(X, false, uint16(len("WM_PROTOCOLS")), "WM_PROTOCOLS").Reply()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "intern WM_PROTOCOLS:", err)
 		os.Exit(1)
 	}
-	wmDel, err := xproto.InternAtom(X, true, uint16(len("WM_DELETE_WINDOW")), "WM_DELETE_WINDOW").Reply()
+	wmDel, err := xproto.InternAtom(X, false, uint16(len("WM_DELETE_WINDOW")), "WM_DELETE_WINDOW").Reply()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "intern WM_DELETE_WINDOW:", err)
 		os.Exit(1)
@@ -65,10 +65,13 @@ func main() {
 	xproto.ChangeProperty(X, xproto.PropModeReplace, wid,
 		wmProto.Atom, xproto.AtomAtom, 32, 1, delBytes)
 
-	title := "proxxxy testclient"
-	xproto.ChangeProperty(X, xproto.PropModeReplace, wid,
-		xproto.AtomWmName, xproto.AtomString, 8,
-		uint32(len(title)), []byte(title))
+	const title = "proxxxy testclient"
+	setTitle := func() {
+		xproto.ChangeProperty(X, xproto.PropModeReplace, wid,
+			xproto.AtomWmName, xproto.AtomString, 8,
+			uint32(len(title)), []byte(title))
+	}
+	setTitle()
 
 	gcid, err := xproto.NewGcontextId(X)
 	if err != nil {
@@ -106,16 +109,24 @@ func main() {
 	for {
 		ev, xerr := X.WaitForEvent()
 		if xerr != nil || ev == nil {
+			if xerr != nil {
+				fmt.Fprintln(os.Stderr, "testclient: WaitForEvent error:", xerr)
+			} else {
+				fmt.Fprintln(os.Stderr, "testclient: connection closed (nil event)")
+			}
 			return
 		}
 		switch e := ev.(type) {
 		case xproto.ExposeEvent:
 			draw()
+			setTitle()
 		case xproto.ClientMessageEvent:
 			if xproto.Atom(e.Data.Data32[0]) == deleteAtom {
+				fmt.Fprintln(os.Stderr, "testclient: WM_DELETE_WINDOW received, exiting")
 				return
 			}
 		case xproto.DestroyNotifyEvent:
+			fmt.Fprintf(os.Stderr, "testclient: DestroyNotify for window 0x%x, exiting\n", e.Window)
 			return
 		}
 	}

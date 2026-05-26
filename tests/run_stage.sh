@@ -45,7 +45,7 @@ go build -o "$RESULTS/proxxxy-server" "$REPO/cmd/server/"
 go build -o "$RESULTS/proxxxy-client" "$REPO/cmd/client/"
 
 log "Starting Xvfb :${REAL_DISP}..."
-Xvfb ":${REAL_DISP}" -screen 0 1920x1080x24 &
+Xvfb ":${REAL_DISP}" -screen 0 1920x1080x24 -ac &
 XVFB_PID=$!
 sleep 0.5
 

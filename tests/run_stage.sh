@@ -148,15 +148,43 @@ send_input() {
             fi
             ;;
         gimp)
-            local wid
-            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --class "Gimp" 2>/dev/null | head -1 || true)
+            local wid wx wy before_n after_n
+            # Find the main GIMP window as the largest Gimp-class window by area.
+            # Searching by WM_NAME is unreliable: GIMP sets WM_NAME on multiple
+            # windows (including tiny stubs), and after reconnect+synthesis the
+            # order is unpredictable. The main window (~800×600) always dominates
+            # helper windows (1×1, 10×10) in area.
+            local max_area=0 w geom gx gy gw gh ga
+            for w in $(DISPLAY=":${REAL_DISP}" xdotool search --class "Gimp" 2>/dev/null || true); do
+                geom=$(DISPLAY=":${REAL_DISP}" xdotool getwindowgeometry --shell "$w" 2>/dev/null || true)
+                gw=$(echo "$geom" | grep '^WIDTH='  | cut -d= -f2)
+                gh=$(echo "$geom" | grep '^HEIGHT=' | cut -d= -f2)
+                ga=$(( ${gw:-0} * ${gh:-0} ))
+                if [[ $ga -gt $max_area ]]; then
+                    max_area=$ga; wid=$w
+                    gx=$(echo "$geom" | grep '^X=' | cut -d= -f2)
+                    gy=$(echo "$geom" | grep '^Y=' | cut -d= -f2)
+                    wx=${gx:-0}; wy=${gy:-0}
+                fi
+            done
             if [[ -n "$wid" ]]; then
-                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" alt+F
-                sleep 0.3
-                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" Escape
+                # Count only visible (mapped) windows: the synthesized state may include
+                # unmapped popup windows from the previous cycle. When the menu opens it
+                # maps a pre-existing window, so --onlyvisible correctly detects the change.
+                before_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible --class "Gimp" 2>/dev/null | wc -l)
+                log "  DEBUG gimp send_input: cycle=${cycle} wid=${wid} wx=${wx:-0} wy=${wy:-0} click=$((${wx:-0}+50)),$((${wy:-0}+15)) before_n=${before_n}"
+                # Real pointer click on File menu — exercises XI2 event routing (not XSendEvent)
+                DISPLAY=":${REAL_DISP}" xdotool mousemove --sync "$((wx + 50))" "$((wy + 15))"
+                DISPLAY=":${REAL_DISP}" xdotool click 1
+                sleep 2
+                after_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible --class "Gimp" 2>/dev/null | wc -l)
+                if [[ $after_n -le $before_n ]]; then
+                    fail "cycle ${cycle}: GIMP click did not open menu (window count: ${before_n} → ${after_n}; XI2 event routing failure)"
+                fi
+                DISPLAY=":${REAL_DISP}" xdotool key Escape
                 sleep 0.2
             else
-                log "  GIMP window not found for input"
+                log "  GIMP main window not found for input"
             fi
             ;;
     esac
@@ -277,6 +305,18 @@ for CYCLE in $(seq 1 "$RECONNECTS"); do
     wait_for_synthesis "$SYNTH_START"
     wait_for_window "$APP_WINDOW"
     sleep 0.5
+
+    # Verify input works after reconnect — exercises synthesis correctness.
+    screenshot "cycle-${CYCLE}-post-reconnect"
+    send_input "$INPUT_MODE" "${CYCLE}-post"
+    screenshot "cycle-${CYCLE}-post-reconnect-input"
+
+    ERRS=$(check_new_errors)
+    if [[ -n "$ERRS" ]]; then
+        log "X11 errors after reconnect cycle ${CYCLE}:"
+        echo "$ERRS"
+        fail "X11 errors after reconnect at cycle ${CYCLE} (see above)"
+    fi
 
     PASS=$((PASS + 1))
 done

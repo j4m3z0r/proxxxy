@@ -160,6 +160,12 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 		remap(4 + s)  // src drawable
 		remap(8 + s)  // dst drawable
 		remap(12 + s) // GC
+	case x11.OpcodeXInput:
+		// XInput2 extension: minor opcode at byte[1] determines field layout.
+		// XISelectEvents: window ID at [4]. Device IDs are not X resources.
+		if len(cmd) >= 2 && cmd[1] == x11.XISelectEvents {
+			remap(4 + s) // window
+		}
 	case x11.OpcodeMITSHM:
 		// MIT-SHM extension: minor opcode at byte[1] determines field layout.
 		// ShmAttach/ShmDetach: shmseg at [4]; default remap covers [4] and [8]

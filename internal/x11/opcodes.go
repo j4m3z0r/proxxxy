@@ -111,6 +111,17 @@ const (
 	SYNCDestroyCounter = 6
 )
 
+// OpcodeXInput is the major opcode assigned to the XInput extension by X.org.
+// We use it to track XISelectEvents calls so synthesis can replay XI2 event
+// masks after reconnect — without this, GTK3 apps receive no button/key events
+// after reconnect because they use XISelectEvents (not XSelectInput) for input.
+const OpcodeXInput = 131
+
+// XI minor opcodes (XI2proto.h).
+const (
+	XISelectEvents = 46
+)
+
 // RENDER extension minor opcodes (renderproto.h, RENDER protocol v0.11+).
 const (
 	RenderCreatePicture             = 4

@@ -7,18 +7,22 @@ import (
 
 // Window represents a tracked X11 window.
 type Window struct {
-	ID          uint32
-	Parent      uint32
-	X, Y        int16
-	Width       uint16
-	Height      uint16
-	BorderWidth uint16
-	Depth       byte
-	Class       uint16
-	Visual      uint32
-	Mapped      bool
-	Children    []uint32
-	createReq   []byte
+	ID               uint32
+	Parent           uint32
+	X, Y             int16
+	Width            uint16
+	Height           uint16
+	BorderWidth      uint16
+	Depth            byte
+	Class            uint16
+	Visual           uint32
+	Mapped           bool
+	Children         []uint32
+	EventMask        uint32 // current XSelectInput event mask (CreateWindow + ChangeWindowAttributes)
+	PendingConfigures uint32 // ConfigureWindow requests sent since last DrainPendingConfigures
+	PropertyCmds     [][]byte // raw ChangeProperty request bytes in order, replayed during synthesis
+	Xi2Masks         [][]byte // raw XISelectEvents request bytes in order, replayed during synthesis
+	createReq        []byte
 }
 
 // GC represents a tracked X11 graphics context.
@@ -141,6 +145,10 @@ func (a *AppConn) ProcessRequest(req []byte) {
 	switch opcode {
 	case OpcodeCreateWindow:
 		a.handleCreateWindow(req)
+	case OpcodeChangeWindowAttributes:
+		a.handleChangeWindowAttributes(req)
+	case OpcodeChangeProperty:
+		a.handleChangeProperty(req)
 	case OpcodeConfigureWindow:
 		a.handleConfigureWindow(req)
 	case OpcodeMapWindow:
@@ -151,6 +159,8 @@ func (a *AppConn) ProcessRequest(req []byte) {
 		a.handleUnmapWindow(req)
 	case OpcodeDestroyWindow:
 		a.handleDestroyWindow(req)
+	case OpcodeDestroySubwindows:
+		a.handleDestroySubwindows(req)
 	case OpcodeCreateGC:
 		a.handleCreateGC(req)
 	case OpcodeChangeGC:
@@ -171,6 +181,8 @@ func (a *AppConn) ProcessRequest(req []byte) {
 		a.handleFreeCursor(req)
 	case OpcodeRender:
 		a.handleRender(req)
+	case OpcodeXInput:
+		a.handleXInput(req)
 	case OpcodeMITSHM:
 		a.handleMITSHM(req)
 	case OpcodeSYNC:
@@ -198,6 +210,19 @@ func (a *AppConn) handleCreateWindow(req []byte) {
 		Visual:      U32(req, 24, a.Order),
 		Depth:       req[1],
 		createReq:   cp,
+	}
+	// Extract CWEventMask (bit 11) from the value-list if present.
+	valueMask := U32(req, 28, a.Order)
+	if valueMask&(1<<11) != 0 {
+		off := 32
+		for b := uint(0); b < 11; b++ {
+			if valueMask&(1<<b) != 0 {
+				off += 4
+			}
+		}
+		if len(req) >= off+4 {
+			w.EventMask = U32(req, off, a.Order)
+		}
 	}
 	a.windows[w.ID] = w
 	if p, ok := a.windows[w.Parent]; ok {
@@ -235,6 +260,73 @@ func (a *AppConn) handleConfigureWindow(req []byte) {
 		a.Order.PutUint16(w.createReq[18:], w.Height)
 		a.Order.PutUint16(w.createReq[20:], w.BorderWidth)
 	}
+	w.PendingConfigures++
+}
+
+func (a *AppConn) handleChangeWindowAttributes(req []byte) {
+	// Layout: [opcode:1][pad:1][length:2][window:4][value-mask:4][values...]
+	if len(req) < 12 {
+		return
+	}
+	wid := U32(req, 4, a.Order)
+	w, ok := a.windows[wid]
+	if !ok {
+		return
+	}
+	valueMask := U32(req, 8, a.Order)
+	if valueMask&(1<<11) == 0 { // no CWEventMask — nothing to track
+		return
+	}
+	off := 12
+	for b := uint(0); b < 11; b++ {
+		if valueMask&(1<<b) != 0 {
+			off += 4
+		}
+	}
+	if len(req) >= off+4 {
+		w.EventMask = U32(req, off, a.Order)
+	}
+}
+
+func (a *AppConn) handleXInput(req []byte) {
+	// XISelectEvents layout: [major:1][minor:1][len:2][window:4][num_masks:2][pad:2][masks...]
+	if len(req) < 12 || req[1] != XISelectEvents {
+		return
+	}
+	winID := U32(req, 4, a.Order)
+	w, ok := a.windows[winID]
+	if !ok {
+		return
+	}
+	cp := make([]byte, len(req))
+	copy(cp, req)
+	w.Xi2Masks = append(w.Xi2Masks, cp)
+}
+
+func (a *AppConn) handleChangeProperty(req []byte) {
+	// Layout: [opcode:1][mode:1][len:2][window:4][property-atom:4][type-atom:4][format:1][pad:3][data-len:4][data...]
+	if len(req) < 24 {
+		return
+	}
+	wid := U32(req, 4, a.Order)
+	w, ok := a.windows[wid]
+	if !ok {
+		return
+	}
+	cp := make([]byte, len(req))
+	copy(cp, req)
+	// Replace (mode=0) overwrites same-property entries to avoid stale values;
+	// Append/Prepend (mode=1/2) just accumulate.
+	if req[1] == 0 {
+		prop := U32(req, 8, a.Order)
+		for i, prev := range w.PropertyCmds {
+			if len(prev) >= 12 && U32(prev, 8, a.Order) == prop {
+				w.PropertyCmds[i] = cp
+				return
+			}
+		}
+	}
+	w.PropertyCmds = append(w.PropertyCmds, cp)
 }
 
 func (a *AppConn) handleMapWindow(req []byte) {
@@ -281,11 +373,40 @@ func (a *AppConn) handleDestroyWindow(req []byte) {
 	if len(req) < 8 {
 		return
 	}
-	id := U32(req, 4, a.Order)
-	if w, ok := a.windows[id]; ok {
-		if p, ok2 := a.windows[w.Parent]; ok2 {
-			p.Children = removeID(p.Children, id)
-		}
+	a.destroyWindowTree(U32(req, 4, a.Order))
+}
+
+func (a *AppConn) handleDestroySubwindows(req []byte) {
+	if len(req) < 8 {
+		return
+	}
+	parentID := U32(req, 4, a.Order)
+	parent, ok := a.windows[parentID]
+	if !ok {
+		return
+	}
+	for _, childID := range append([]uint32(nil), parent.Children...) {
+		a.destroyWindowTree(childID)
+	}
+}
+
+// destroyWindowTree removes a window and all its descendants from a.windows.
+// X11 DestroyWindow destroys the entire subtree; without cascading here, orphan
+// children remain in the map with a stale parent, causing BadWindow during
+// synthesis when findRoots treats them as roots and tries to create them with
+// a parent that no longer exists.
+func (a *AppConn) destroyWindowTree(id uint32) {
+	w, ok := a.windows[id]
+	if !ok {
+		return
+	}
+	// Copy children slice before recursing — the recursive calls modify Children.
+	children := append([]uint32(nil), w.Children...)
+	for _, childID := range children {
+		a.destroyWindowTree(childID)
+	}
+	if p, ok2 := a.windows[w.Parent]; ok2 {
+		p.Children = removeID(p.Children, id)
 	}
 	delete(a.windows, id)
 }
@@ -450,8 +571,9 @@ func (a *AppConn) Windows() map[uint32]Window {
 	defer a.mu.RUnlock()
 	out := make(map[uint32]Window, len(a.windows))
 	for k, v := range a.windows {
-		w := *v                                          // copy struct
+		w := *v                                            // copy struct
 		w.Children = append([]uint32(nil), v.Children...) // deep copy slice
+		w.Xi2Masks = append([][]byte(nil), v.Xi2Masks...) // shallow copy outer slice
 		out[k] = w
 	}
 	return out
@@ -715,6 +837,37 @@ func (a *AppConn) SyncCounters() map[uint32][]byte {
 	out := make(map[uint32][]byte, len(a.syncCounters))
 	for k, v := range a.syncCounters {
 		out[k] = append([]byte(nil), v...)
+	}
+	return out
+}
+
+// ResetPendingConfigures zeroes the PendingConfigures count for every window.
+// Call this at the start of synthesis so that DrainPendingConfigures later
+// returns only the count from this reconnect session (not accumulated counts
+// from normal operation where ConfigureWindow/ConfigureNotify were balanced).
+func (a *AppConn) ResetPendingConfigures() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, w := range a.windows {
+		w.PendingConfigures = 0
+	}
+}
+
+// DrainPendingConfigures returns and resets the PendingConfigures count for each
+// window that had at least one outstanding ConfigureWindow request. Call this
+// during synthesis to determine how many ConfigureNotify events to inject per
+// window — one per pending configure request is needed to drain GTK3's
+// configure_request_count (which it increments on ConfigureWindow and
+// decrements on ConfigureNotify).
+func (a *AppConn) DrainPendingConfigures() map[uint32]uint32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[uint32]uint32)
+	for id, w := range a.windows {
+		if w.PendingConfigures > 0 {
+			out[id] = w.PendingConfigures
+			w.PendingConfigures = 0
+		}
 	}
 	return out
 }

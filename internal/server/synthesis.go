@@ -168,9 +168,80 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 
 	// 3. GCs: create + replay all attribute changes.
 	// Must come before pixmap draw commands since draws reference GC IDs.
+	//
+	// scratchPixmaps: depth → pixmap ID. When a GC's original drawable is
+	// gone and no depth-matched drawable exists, we create a 1×1 scratch
+	// pixmap so the GC gets the correct depth. IDs count down from the top
+	// of the resource range to avoid colliding with GIMP's upward-counting IDs.
+	scratchPixmaps := make(map[byte]uint32)
+	// Start scratch IDs at ridBase|(ridMask - ridMask/4) and count DOWN.
+	// The top quarter of the range (ridMask - ridMask/4 + 1 .. ridMask) is
+	// reserved for the client-side scratch colormaps (injectColormap in client.go),
+	// which also allocate downward from ridBase|ridMask. The lower three quarters
+	// of the range belong to GIMP resources and synthesis scratch pixmaps.
+	scratchCounter := ridMask - ridMask/4 // counts down
+	ensureScratchPixmap := func(depth byte, drawableWin uint32) uint32 {
+		if id, ok := scratchPixmaps[depth]; ok {
+			return id
+		}
+		id := ridBase | scratchCounter
+		scratchCounter--
+		cr := make([]byte, 16)
+		cr[0] = x11.OpcodeCreatePixmap
+		cr[1] = depth
+		ac.Order.PutUint16(cr[2:4], 4)
+		ac.Order.PutUint32(cr[4:8], id)
+		ac.Order.PutUint32(cr[8:12], drawableWin)
+		ac.Order.PutUint16(cr[12:14], 1) // width=1
+		ac.Order.PutUint16(cr[14:16], 1) // height=1
+		log.Printf("server: synthesis conn %d: CreatePixmap(scratch) 0x%08x depth=%d",
+			ac.ID, id, depth)
+		s.sendToClient(ac.ID, cr)
+		// Register in pixmaps map so sanitizeGCDrawable finds it.
+		pixmaps[id] = x11.Pixmap{ID: id, Depth: depth, Width: 1, Height: 1}
+		scratchPixmaps[depth] = id
+		return id
+	}
+
+	// Pick any surviving window as the drawable for scratch pixmap creation.
+	var anyWin uint32
+	for id := range windows {
+		anyWin = id
+		break
+	}
+
 	gcs := ac.GCs()
 	for _, gc := range gcs {
 		if cr := gc.CreateReq(); len(cr) > 0 {
+			// If the original drawable is gone and no depth-matched drawable
+			// exists yet, create a scratch pixmap of the required depth first.
+			// This preserves the GC's depth property across synthesis, preventing
+			// BadMatch when the app uses the GC on a drawable of the original depth.
+			if gc.DrawableDepth != 0 && anyWin != 0 {
+				_, inWin := windows[gc.Drawable]
+				_, inPM := pixmaps[gc.Drawable]
+				if !inWin && !inPM {
+					// Drawable is gone. Check if any depth-matched drawable exists.
+					needScratch := true
+					for _, w := range windows {
+						if w.Depth == gc.DrawableDepth {
+							needScratch = false
+							break
+						}
+					}
+					if needScratch {
+						for _, pm := range pixmaps {
+							if pm.Depth == gc.DrawableDepth {
+								needScratch = false
+								break
+							}
+						}
+					}
+					if needScratch {
+						ensureScratchPixmap(gc.DrawableDepth, anyWin)
+					}
+				}
+			}
 			cr = sanitizeGCDrawable(cr, gc.Drawable, gc.DrawableDepth, windows, pixmaps, ac.Order)
 			cr = sanitizeGCPixmapAttrs(cr, pixmaps, ac.Order)
 			cr = sanitizeGCFont(cr, fonts, ac.Order)
@@ -260,6 +331,14 @@ func (s *Server) synthesiseWindowCreate(connID uint32, all map[uint32]x11.Window
 				connID, w.ID, w.EventMask)
 			s.sendToClient(connID, makeSelectInput(wid, w.EventMask, order))
 		}
+		// Replay XISelectEvents (XI2 input masks). GTK3 uses XISelectEvents
+		// (not XSelectInput) for button/key events — without replay, clicks
+		// and keypresses are not delivered after reconnect.
+		for _, xi2req := range w.Xi2Masks {
+			log.Printf("server: synthesis conn %d: XISelectEvents 0x%08x len=%d",
+				connID, w.ID, len(xi2req))
+			s.sendToClient(connID, xi2req)
+		}
 		for _, pcmd := range w.PropertyCmds {
 			s.sendToClient(connID, pcmd)
 		}
@@ -300,8 +379,15 @@ func (s *Server) synthesisConfigureNotify(ac *x11.AppConn, pendingCfgs map[uint3
 		return
 	}
 	seqNum := ac.SeqNum()
-	for _, w := range ac.Windows() {
+	windows := ac.Windows()
+	for _, w := range windows {
 		if !w.Mapped || w.Width == 0 || w.Height == 0 {
+			continue
+		}
+		// Only inject for toplevel windows (parent is not another app window).
+		// configure_request_count is tracked by GTK3 only for WM-managed toplevels.
+		// Injecting ConfigureNotify for child windows corrupts GTK3's layout state.
+		if _, parentIsApp := windows[w.Parent]; parentIsApp {
 			continue
 		}
 		count := pendingCfgs[w.ID]

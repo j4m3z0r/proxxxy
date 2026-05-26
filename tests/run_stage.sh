@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# E2E reconnect harness for proxxxy.
+# Usage: tests/run_stage.sh --stage N [--reconnects N] [--display N]
+# Stages: 1=testclient 2=xclock 3=xterm 4=mousepad 5=gimp-baseline 6=gimp
+# Requirements: Xvfb, scrot, xdotool in PATH.
+
+set -euo pipefail
+
+STAGE=1
+RECONNECTS=10
+BASE_DISP=90
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --stage)      STAGE=$2;      shift 2 ;;
+        --reconnects) RECONNECTS=$2; shift 2 ;;
+        --display)    BASE_DISP=$2;  shift 2 ;;
+        *) echo "unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+REAL_DISP=$BASE_DISP
+FAKE_DISP=$((BASE_DISP + 1))
+PORT=$((7000 + BASE_DISP))
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RESULTS="$REPO/tests/results/$(date +%Y%m%d-%H%M%S)-stage${STAGE}"
+mkdir -p "$RESULTS"
+
+SERVER_PID="" CLIENT_PID="" APP_PID="" XVFB_PID=""
+
+cleanup() {
+    [[ -n "${APP_PID:-}" ]]    && kill "$APP_PID"    2>/dev/null || true
+    [[ -n "${CLIENT_PID:-}" ]] && kill "$CLIENT_PID" 2>/dev/null || true
+    [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
+    [[ -n "${XVFB_PID:-}" ]]   && kill "$XVFB_PID"  2>/dev/null || true
+    rm -f "/tmp/.X11-unix/X${FAKE_DISP}" "/tmp/.X${FAKE_DISP}-lock"
+}
+trap cleanup EXIT
+
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+fail() { log "FAIL: $*"; log "Results saved to: $RESULTS"; exit 1; }
+
+log "Building binaries..."
+go build -o "$RESULTS/proxxxy-server" "$REPO/cmd/server/"
+go build -o "$RESULTS/proxxxy-client" "$REPO/cmd/client/"
+
+log "Starting Xvfb :${REAL_DISP}..."
+Xvfb ":${REAL_DISP}" -screen 0 1920x1080x24 &
+XVFB_PID=$!
+sleep 0.5
+
+start_server() {
+    rm -f "/tmp/.X11-unix/X${FAKE_DISP}" "/tmp/.X${FAKE_DISP}-lock"
+    DISPLAY=":${REAL_DISP}" "$RESULTS/proxxxy-server" \
+        -display "${FAKE_DISP}" -port "${PORT}" \
+        >> "$RESULTS/server.log" 2>&1 &
+    SERVER_PID=$!
+    sleep 0.3
+}
+
+start_client() {
+    DISPLAY=":${REAL_DISP}" "$RESULTS/proxxxy-client" \
+        -server "localhost:${PORT}" \
+        >> "$RESULTS/client.log" 2>&1 &
+    CLIENT_PID=$!
+}
+
+wait_for_window() {
+    local title="$1" deadline=$((SECONDS + 30))
+    log "Waiting for window: '$title'..."
+    while [[ $SECONDS -lt $deadline ]]; do
+        if DISPLAY=":${REAL_DISP}" xdotool search --name "$title" >/dev/null 2>&1; then
+            log "Window found: '$title'"
+            return 0
+        fi
+        sleep 0.5
+    done
+    fail "window '$title' never appeared (30s timeout)"
+}
+
+wait_for_synthesis() {
+    local since="$1" deadline=$((SECONDS + 30))
+    log "Waiting for synthesis (server.log line >= ${since})..."
+    while [[ $SECONDS -lt $deadline ]]; do
+        if tail -n "+${since}" "$RESULTS/server.log" 2>/dev/null \
+                | grep -q "server: synthesis complete"; then
+            sleep 0.3
+            log "Synthesis complete."
+            return 0
+        fi
+        sleep 0.2
+    done
+    fail "synthesis never completed after line ${since} (30s timeout)"
+}
+
+screenshot() {
+    local name="$1"
+    DISPLAY=":${REAL_DISP}" scrot "$RESULTS/${name}.png" 2>/dev/null \
+        && log "  screenshot: ${name}.png" \
+        || log "  screenshot failed (non-fatal): ${name}.png"
+}
+
+ERROR_OFFSET=1
+check_new_errors() {
+    local errs
+    errs=$(tail -n "+${ERROR_OFFSET}" "$RESULTS/client.log" 2>/dev/null \
+        | grep -E "BadWindow|BadMatch|BadFont|BadGC|BadValue|BadRequest|code=[1-9]" || true)
+    ERROR_OFFSET=$(( $(wc -l < "$RESULTS/client.log" 2>/dev/null || echo 1) + 1 ))
+    printf '%s' "$errs"
+}
+
+send_input() {
+    local mode="$1" cycle="$2"
+    case $mode in
+        none)
+            sleep 0.5
+            ;;
+        xterm)
+            local wid
+            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --name "xterm" 2>/dev/null | head -1 || true)
+            if [[ -n "$wid" ]]; then
+                DISPLAY=":${REAL_DISP}" xdotool type --window "$wid" "echo hello${cycle}"
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" Return
+                sleep 0.3
+            else
+                log "  xterm window not found for input"
+            fi
+            ;;
+        mousepad)
+            local wid
+            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --name "Mousepad" 2>/dev/null | head -1 || true)
+            if [[ -n "$wid" ]]; then
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" alt+F
+                sleep 0.3
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" Escape
+                sleep 0.2
+            else
+                log "  Mousepad window not found for input"
+            fi
+            ;;
+        gimp)
+            local wid
+            wid=$(DISPLAY=":${REAL_DISP}" xdotool search --name "GIMP" 2>/dev/null | head -1 || true)
+            if [[ -n "$wid" ]]; then
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" alt+F
+                sleep 0.3
+                DISPLAY=":${REAL_DISP}" xdotool key --window "$wid" Escape
+                sleep 0.2
+            else
+                log "  GIMP window not found for input"
+            fi
+            ;;
+    esac
+}
+
+# Stage 5: GIMP baseline (no proxxxy)
+if [[ $STAGE -eq 5 ]]; then
+    log "Stage 5: GIMP baseline — running GIMP directly on :${REAL_DISP} (no proxxxy)"
+    GDK_SYNCHRONIZE=1 DISPLAY=":${REAL_DISP}" gimp \
+        >> "$RESULTS/app.log" 2>&1 &
+    APP_PID=$!
+    log "Waiting 15s for GIMP to start and settle..."
+    sleep 15
+    log "Capturing baseline errors..."
+    grep -E "BadWindow|BadMatch|BadFont|BadGC|BadValue|BadRequest|code=[1-9]" \
+        "$RESULTS/app.log" 2>/dev/null | tee "$RESULTS/baseline-errors.txt" || true
+    log "Stage 5 baseline captured: $RESULTS/baseline-errors.txt"
+    exit 0
+fi
+
+# Stage config
+case $STAGE in
+    1)
+        go build -o "$RESULTS/testclient" "$REPO/cmd/testclient/"
+        APP_BIN="$RESULTS/testclient"
+        APP_ARGS=()
+        APP_ENV=()
+        APP_WINDOW="proxxxy testclient"
+        INPUT_MODE="none"
+        ;;
+    2)
+        APP_BIN="xclock"
+        APP_ARGS=()
+        APP_ENV=(XSYNCHRONIZE=yes)
+        APP_WINDOW="xclock"
+        INPUT_MODE="none"
+        ;;
+    3)
+        APP_BIN="xterm"
+        APP_ARGS=(-synchronous)
+        APP_ENV=()
+        APP_WINDOW="xterm"
+        INPUT_MODE="xterm"
+        ;;
+    4)
+        APP_BIN="mousepad"
+        APP_ARGS=()
+        APP_ENV=(GDK_SYNCHRONIZE=1)
+        APP_WINDOW="Mousepad"
+        INPUT_MODE="mousepad"
+        ;;
+    6)
+        APP_BIN="gimp"
+        APP_ARGS=()
+        APP_ENV=(GDK_SYNCHRONIZE=1)
+        APP_WINDOW="GIMP"
+        INPUT_MODE="gimp"
+        ;;
+    *)
+        echo "Unknown stage: $STAGE" >&2; exit 1 ;;
+esac
+
+start_app() {
+    env DISPLAY=":${FAKE_DISP}" "${APP_ENV[@]+"${APP_ENV[@]}"}" \
+        "$APP_BIN" "${APP_ARGS[@]+"${APP_ARGS[@]}"}" \
+        >> "$RESULTS/app.log" 2>&1 &
+    APP_PID=$!
+}
+
+# === Main execution ===
+log "Stage $STAGE | $RECONNECTS reconnects | real=:${REAL_DISP} fake=:${FAKE_DISP} port=${PORT}"
+
+start_server
+start_client
+sleep 0.3
+start_app
+
+wait_for_window "$APP_WINDOW"
+sleep 1
+screenshot "initial"
+
+PASS=0
+for CYCLE in $(seq 1 "$RECONNECTS"); do
+    log "=== Cycle ${CYCLE}/${RECONNECTS} ==="
+
+    screenshot "cycle-${CYCLE}-pre-input"
+    send_input "$INPUT_MODE" "$CYCLE"
+    screenshot "cycle-${CYCLE}-post-input"
+
+    ERRS=$(check_new_errors)
+    if [[ -n "$ERRS" ]]; then
+        log "X11 errors detected:"
+        echo "$ERRS"
+        fail "X11 errors at cycle ${CYCLE} (see above)"
+    fi
+
+    # Note position in server.log before reconnect so wait_for_synthesis
+    # only looks at lines added after the reconnect.
+    SYNTH_START=$(( $(wc -l < "$RESULTS/server.log" 2>/dev/null || echo 0) + 1 ))
+
+    log "Killing client..."
+    kill "$CLIENT_PID" 2>/dev/null || true
+    CLIENT_PID=""
+    sleep 1
+
+    log "Reconnecting client..."
+    start_client
+    wait_for_synthesis "$SYNTH_START"
+    wait_for_window "$APP_WINDOW"
+    sleep 0.5
+
+    PASS=$((PASS + 1))
+done
+
+log "PASS: Stage ${STAGE} — ${PASS}/${RECONNECTS} reconnects clean"
+log "Screenshots and logs: $RESULTS"
+exit 0

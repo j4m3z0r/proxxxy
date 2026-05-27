@@ -319,8 +319,8 @@ func (s *Server) synthesiseAppConn(ac *x11.AppConn) {
 				// Drawable gone — use glyph cursor fallback.
 				tmpFontID := ridBase | scratchCounter
 				scratchCounter--
-				log.Printf("server: synthesis conn %d: RenderCreateCursor 0x%08x fallback glyph cursor (drawable 0x%08x gone)",
-					ac.ID, cur.ID, drawable)
+				log.Printf("server: synthesis conn %d: RenderCreateCursor 0x%08x fallback glyph cursor (drawable 0x%08x gone), tmpFontID=0x%08x",
+					ac.ID, cur.ID, drawable, tmpFontID)
 				s.sendToClient(ac.ID, makeOpenFont(tmpFontID, "cursor", ac.Order))
 				s.sendToClient(ac.ID, makeCreateGlyphCursor(cur.ID, tmpFontID, ac.Order))
 				s.sendToClient(ac.ID, makeCloseFont(tmpFontID, ac.Order))

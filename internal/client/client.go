@@ -254,6 +254,100 @@ func applyIDRemap(cmd []byte, r idRemap) []byte {
 	return out
 }
 
+// applyEventReverseRemap translates resource IDs in an X11 event from the
+// synthesis xconn's ID space (newBase) back to the app's original ID space
+// (oldBase). This is the inverse of applyIDRemap: outgoing synthesis requests
+// are forward-remapped (oldBase→newBase); incoming events must be
+// reverse-remapped (newBase→oldBase) so the app recognises its own resources.
+func applyEventReverseRemap(event []byte, r idRemap) []byte {
+	if len(event) < 32 || r.oldBase == r.newBase {
+		return event
+	}
+	out := make([]byte, len(event))
+	copy(out, event)
+
+	rev := func(off int) {
+		if len(out) < off+4 {
+			return
+		}
+		id := r.order.Uint32(out[off:])
+		if id != 0 && id&^r.oldMask == r.newBase {
+			r.order.PutUint32(out[off:], r.oldBase|(id&r.oldMask))
+		}
+	}
+
+	evType := event[0] & 0x7f // strip SendEvent bit
+	switch evType {
+	case 2, 3: // KeyPress, KeyRelease: event=+4, root=+8 (server-owned, skip), child=+12
+		rev(4)
+		rev(12)
+	case 4, 5, 6: // ButtonPress, ButtonRelease, MotionNotify
+		rev(4)
+		rev(12)
+	case 7, 8: // EnterNotify, LeaveNotify
+		rev(4)
+		rev(12)
+	case 9, 10: // FocusIn, FocusOut
+		rev(4)
+	case 12: // Expose
+		rev(4)
+	case 13: // GraphicsExposure: drawable=+4
+		rev(4)
+	case 15: // VisibilityNotify
+		rev(4)
+	case 16: // CreateNotify: parent=+4, window=+8
+		rev(4)
+		rev(8)
+	case 17, 18, 19, 24, 26: // DestroyNotify, UnmapNotify, MapNotify, GravityNotify, CirculateNotify
+		rev(4)
+		rev(8)
+	case 20: // MapRequest
+		rev(4)
+		rev(8)
+	case 21: // ReparentNotify: event=+4, window=+8, parent=+12
+		rev(4)
+		rev(8)
+		rev(12)
+	case 22: // ConfigureNotify: event=+4, window=+8, above_sibling=+12
+		rev(4)
+		rev(8)
+		rev(12)
+	case 23: // ConfigureRequest: parent=+4, window=+8, sibling=+12
+		rev(4)
+		rev(8)
+		rev(12)
+	case 25: // ResizeRequest
+		rev(4)
+	case 27: // CirculateRequest: parent=+4, window=+8
+		rev(4)
+		rev(8)
+	case 28: // PropertyNotify: window=+4 (atom at +8 is NOT a resource ID)
+		rev(4)
+	case 29: // SelectionClear: window=+4
+		rev(4)
+	case 30: // SelectionRequest: owner=+4, requestor=+8
+		rev(4)
+		rev(8)
+	case 31: // SelectionNotify: requestor=+4
+		rev(4)
+	case 32: // ColormapNotify: window=+4, colormap=+8
+		rev(4)
+		rev(8)
+	case 33: // ClientMessage: window=+4
+		rev(4)
+	case 35: // GenericEvent (XI2 etc.)
+		// XIDeviceEvent layout (evtype 2-10): root=+20 (skip), event=+24, child=+28
+		if len(event) >= 32 {
+			evtype := r.order.Uint16(event[8:10])
+			if evtype >= 2 && evtype <= 10 {
+				rev(24)
+				rev(28)
+			}
+		}
+	}
+	return out
+}
+
 // synthXconnState holds per-connID state needed during the synthesis phase.
 type synthXconnState struct {
 	ridBase     uint32
@@ -883,8 +977,29 @@ phase2:
 	// with wrong sequence numbers and Xlib matching them to wrong requests.
 	c.mu.Lock()
 	finalSeqNum := c.synthFinalSeqNums[connID]
+	evRemap, hasEvRemap := c.idRemaps[connID]
 	c.mu.Unlock()
 	seqOffset := uint16(finalSeqNum) - nSynth
+
+	// Helper to assemble a full message buffer from header + tail, applying
+	// reverse event remapping when the ridBase changed between reconnects.
+	assembleAndRemap := func(h *[32]byte, tail []byte) []byte {
+		var full []byte
+		if len(tail) > 0 {
+			full = make([]byte, 32+len(tail))
+			copy(full, h[:])
+			copy(full[32:], tail)
+		} else {
+			full = h[:]
+		}
+		// Reverse-remap resource IDs in events (type ≥ 2): Xvfb delivers events
+		// using the synthesis xconn's ridBase (newBase). Translate back to the
+		// app's original ridBase (oldBase) so the app recognises its own windows.
+		if hasEvRemap && full[0] >= 2 {
+			full = applyEventReverseRemap(full, evRemap)
+		}
+		return full
+	}
 
 	// Helper to forward one message with seq rewriting applied.
 	forward := func(m synthMsg) {
@@ -904,14 +1019,7 @@ phase2:
 		}
 		h := m.hdr
 		order.PutUint16(h[2:4], order.Uint16(h[2:4])+seqOffset)
-		var full []byte
-		if len(m.tail) > 0 {
-			full = make([]byte, 32+len(m.tail))
-			copy(full, h[:])
-			copy(full[32:], m.tail)
-		} else {
-			full = h[:]
-		}
+		full := assembleAndRemap(&h, m.tail)
 		c.srvW.Lock()
 		wire.WriteX11Data(c.server, connID, full) //nolint:errcheck
 		c.srvW.Unlock()
@@ -928,14 +1036,7 @@ phase2:
 	for _, m := range bufferedEvents {
 		h := m.hdr
 		order.PutUint16(h[2:4], appSeq16)
-		var full []byte
-		if len(m.tail) > 0 {
-			full = make([]byte, 32+len(m.tail))
-			copy(full, h[:])
-			copy(full[32:], m.tail)
-		} else {
-			full = h[:]
-		}
+		full := assembleAndRemap(&h, m.tail)
 		c.srvW.Lock()
 		wire.WriteX11Data(c.server, connID, full) //nolint:errcheck
 		c.srvW.Unlock()

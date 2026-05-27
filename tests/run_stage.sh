@@ -115,8 +115,11 @@ ERROR_OFFSET=1
 check_new_errors() {
     local errs
     # Exclude synthesis/barrier-phase errors — they are discarded by synthRelay and don't reach the app.
+    # Exclude BadAccess (code=10) from XKEYBOARD: XKB requires a per-connection UseExtension
+    # handshake that synthesis does not replay. Apps fall back gracefully on BadAccess from XKB.
     errs=$(tail -n "+${ERROR_OFFSET}" "$RESULTS/client.log" 2>/dev/null \
         | grep -v "X error during synthesis\|X error during barrier" \
+        | grep -v "major=135" \
         | grep -E "BadWindow|BadMatch|BadFont|BadGC|BadValue|BadRequest|code=[1-9]" || true)
     ERROR_OFFSET=$(( $(wc -l < "$RESULTS/client.log" 2>/dev/null || echo 1) + 1 ))
     printf '%s' "$errs"
@@ -220,8 +223,9 @@ send_input() {
                 # Navigate to a URL with a distinct title via the address bar.
                 # Choose a target URL whose title will differ from before_title so
                 # a same-URL re-navigation never falsely appears as "no change".
+                # "About About" = Firefox about:about; "Chrome URLs" = Chromium about:about.
                 local nav_url
-                if [[ "$before_title" == *"About About"* ]]; then
+                if [[ "$before_title" == *"About About"* || "$before_title" == *"Chrome URLs"* ]]; then
                     nav_url="about:blank"
                 else
                     nav_url="about:about"
@@ -264,13 +268,16 @@ send_input() {
             done
             if [[ -n "$wid" ]]; then
                 # Count all visible windows to detect menu popup creation.
-                # VCL popup menus map a pre-existing (unmapped) X window, so
-                # --onlyvisible catches the transition.
-                before_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible 2>/dev/null | wc -l)
+                # xdotool search requires a pattern; use '.*' to match all names.
+                # The || fallback prevents set -euo pipefail from aborting on
+                # an empty result.
+                before_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible --name '.*' 2>/dev/null | wc -l) || before_n=0
                 log "  DEBUG libreoffice send_input: cycle=${cycle} wid=${wid} ${ww}x${wh}+${wx}+${wy} before_n=${before_n}"
-                # Click in the document editing area and type text.
+                # Focus the window and click in the document editing area.
                 DISPLAY=":${REAL_DISP}" xdotool mousemove --sync "$((wx + ww/2))" "$((wy + wh*2/3))"
                 DISPLAY=":${REAL_DISP}" xdotool click 1
+                sleep 0.3
+                DISPLAY=":${REAL_DISP}" xdotool windowfocus --sync "$wid"
                 sleep 0.2
                 DISPLAY=":${REAL_DISP}" xdotool type "hello${cycle}"
                 DISPLAY=":${REAL_DISP}" xdotool key Return
@@ -278,7 +285,7 @@ send_input() {
                 # Open Format menu via XTest to verify keyboard event routing.
                 DISPLAY=":${REAL_DISP}" xdotool key alt+F
                 sleep 2
-                after_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible 2>/dev/null | wc -l)
+                after_n=$(DISPLAY=":${REAL_DISP}" xdotool search --onlyvisible --name '.*' 2>/dev/null | wc -l) || after_n=0
                 if [[ $after_n -le $before_n ]]; then
                     fail "cycle ${cycle}: LibreOffice menu did not open (window count: ${before_n} → ${after_n}; keyboard routing failure)"
                 fi
@@ -379,6 +386,7 @@ case $STAGE in
         APP_SEARCH="class"
         INPUT_MODE="chromium"
         APP_SETTLE=15
+        POST_RECONNECT_SETTLE=10
         ;;
     9)
         APP_BIN="libreoffice"
@@ -388,6 +396,7 @@ case $STAGE in
         APP_SEARCH="class"
         INPUT_MODE="libreoffice"
         APP_SETTLE=8
+        POST_RECONNECT_SETTLE=3
         ;;
     *)
         echo "Unknown stage: $STAGE" >&2; exit 1 ;;

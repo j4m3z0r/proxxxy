@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -373,6 +374,12 @@ type Client struct {
 	synthOrders     map[uint32]binary.ByteOrder // byte order for each synthesis xconn (needed to format GetInputFocus)
 	synthFinalSeqNums map[uint32]uint32          // final app seqNum per conn, updated just before SESSION_LIVE
 
+	// GPU extension suppression: track QueryExtension seqnums so DRI2/DRI3/Present
+	// replies can be rewritten to "not present" before reaching the app.
+	connSeqNums    map[uint32]uint32              // connID → seqnum of last request sent to real X server
+	connSuppressed map[uint32]map[uint16]struct{} // connID → seqnums of suppressed QueryExtension requests
+	connOrders     map[uint32]binary.ByteOrder    // connID → byte order (for reply stream parsing)
+
 	// synthState and inSynthesis are accessed only from the main Run() goroutine.
 	inSynthesis bool
 	synthState  map[uint32]*synthXconnState // connID → synthesis xconn state
@@ -387,6 +394,9 @@ func New(serverAddr string) *Client {
 		synthDone:         make(map[uint32]chan struct{}),
 		synthOrders:       make(map[uint32]binary.ByteOrder),
 		synthFinalSeqNums: make(map[uint32]uint32),
+		connSeqNums:       make(map[uint32]uint32),
+		connSuppressed:    make(map[uint32]map[uint16]struct{}),
+		connOrders:        make(map[uint32]binary.ByteOrder),
 		synthState:        make(map[uint32]*synthXconnState),
 	}
 }
@@ -555,6 +565,11 @@ func (c *Client) handleX11Setup(payload []byte) {
 		old.Close()
 	}
 	c.xConns[connID] = xconn
+	// enableBigRequests sent 2 requests (QueryExtension + BigReqEnable) before
+	// handleX11Data can be called for this connID. Pre-seed the seqnum counter
+	// so subsequent handleX11Data calls assign the correct seqnums.
+	c.connSeqNums[connID] = 2
+	c.connOrders[connID] = order
 	if oldBase != 0 && newBase != 0 && oldBase != newBase {
 		log.Printf("client: synthesis conn %d: oldBase=0x%08x mask=0x%08x newBase=0x%08x",
 			connID, oldBase, oldMask, newBase)
@@ -684,6 +699,7 @@ func (c *Client) handleX11Data(payload []byte) {
 	remap, hasRemap := c.idRemaps[connID]
 	c.mu.Unlock()
 
+	isNewConn := false
 	if !ok {
 		xconn, err = dialX11(localDisplay())
 		if err != nil {
@@ -692,9 +708,18 @@ func (c *Client) handleX11Data(payload []byte) {
 		}
 		c.mu.Lock()
 		c.xConns[connID] = xconn
+		// Record byte order from the setup request byte-order indicator.
+		if len(data) > 0 {
+			if data[0] == 0x42 {
+				c.connOrders[connID] = binary.BigEndian
+			} else {
+				c.connOrders[connID] = binary.LittleEndian
+			}
+		}
 		c.mu.Unlock()
 		go c.relayXToServer(connID, xconn)
 		hasRemap = false
+		isNewConn = true
 	}
 
 	if hasRemap {
@@ -711,7 +736,47 @@ func (c *Client) handleX11Data(payload []byte) {
 	}
 	if _, err := xconn.Write(data); err != nil {
 		log.Println("client: write to display:", err)
+		return
 	}
+
+	// Track seqnum and detect QueryExtension requests for GPU extensions.
+	// Setup requests (byte-order indicator 0x6C or 0x42) are not numbered —
+	// skip them. isNewConn implies the first write was the setup request.
+	isSetup := isNewConn || (len(data) > 0 && (data[0] == 0x6C || data[0] == 0x42))
+	if !isSetup {
+		c.mu.Lock()
+		c.connSeqNums[connID]++
+		seqnum := uint16(c.connSeqNums[connID])
+		if len(data) >= 8 && data[0] == x11.OpcodeQueryExtension {
+			order := c.connOrders[connID]
+			if order == nil {
+				order = binary.LittleEndian
+			}
+			nameLen := int(order.Uint16(data[4:6]))
+			if len(data) >= 8+nameLen {
+				name := string(data[8 : 8+nameLen])
+				if isGPUExtension(name) {
+					if c.connSuppressed[connID] == nil {
+						c.connSuppressed[connID] = make(map[uint16]struct{})
+					}
+					c.connSuppressed[connID][seqnum] = struct{}{}
+				}
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
+// isGPUExtension reports whether the named X11 extension uses FD passing (DRI3
+// dma-buf), which proxxxy cannot forward over its TCP wire protocol. Suppressing
+// these extensions forces apps to fall back to software GL (Mesa llvmpipe,
+// SwiftShader) that renders through MIT-SHM/XPutImage paths proxxxy handles.
+func isGPUExtension(name string) bool {
+	switch name {
+	case "DRI2", "DRI3", "Present":
+		return true
+	}
+	return false
 }
 
 func (c *Client) handleCompressed(msg wire.Msg) {
@@ -1059,20 +1124,64 @@ func (c *Client) relayXToServer(connID uint32, xconn net.Conn) {
 		delete(c.xConns, connID)
 		delete(c.decoders, connID)
 		delete(c.idRemaps, connID)
+		delete(c.connSeqNums, connID)
+		delete(c.connSuppressed, connID)
+		delete(c.connOrders, connID)
 		c.mu.Unlock()
 	}()
-	buf := make([]byte, 32*1024)
+	// Parse the X11 reply/event/error stream message-by-message so we can
+	// intercept QueryExtension replies for GPU extensions (DRI2/DRI3/Present)
+	// and rewrite them to "not present" before forwarding to the app.
+	//
+	// X11 message sizes from the server:
+	//   byte[0] == 0: error          → always 32 bytes
+	//   byte[0] == 1: reply          → 32 + uint32(bytes[4:8], LE) * 4 bytes
+	//   byte[0] == 35: GenericEvent  → 32 + uint32(bytes[4:8], LE) * 4 bytes
+	//   other:         event         → always 32 bytes
+	r := bufio.NewReaderSize(xconn, 32*1024)
+	hdr := make([]byte, 32)
 	for {
-		n, err := xconn.Read(buf)
-		if n > 0 {
-			c.srvW.Lock()
-			werr := wire.WriteX11Data(c.server, connID, buf[:n])
-			c.srvW.Unlock()
-			if werr != nil {
-				return
+		if _, err := io.ReadFull(r, hdr); err != nil {
+			return
+		}
+		var tail []byte
+		if hdr[0] == 1 || hdr[0] == 35 { // reply or GenericEvent: has variable-length tail
+			extra := binary.LittleEndian.Uint32(hdr[4:8]) * 4
+			if extra > 0 {
+				tail = make([]byte, extra)
+				if _, err := io.ReadFull(r, tail); err != nil {
+					return
+				}
 			}
 		}
-		if err != nil {
+		if hdr[0] == 1 { // reply: check for suppressed QueryExtension
+			seqnum := binary.LittleEndian.Uint16(hdr[2:4])
+			c.mu.Lock()
+			_, suppress := c.connSuppressed[connID][seqnum]
+			if suppress {
+				delete(c.connSuppressed[connID], seqnum)
+			}
+			c.mu.Unlock()
+			if suppress {
+				// Rewrite QueryExtension reply: extension not present.
+				hdr[8] = 0  // present = false
+				hdr[9] = 0  // major-opcode = 0
+				hdr[10] = 0 // first-event = 0
+				hdr[11] = 0 // first-error = 0
+			}
+		}
+		var full []byte
+		if len(tail) > 0 {
+			full = make([]byte, 32+len(tail))
+			copy(full, hdr)
+			copy(full[32:], tail)
+		} else {
+			full = append([]byte(nil), hdr...)
+		}
+		c.srvW.Lock()
+		werr := wire.WriteX11Data(c.server, connID, full)
+		c.srvW.Unlock()
+		if werr != nil {
 			return
 		}
 	}

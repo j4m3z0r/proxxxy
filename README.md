@@ -35,20 +35,17 @@ brew install go git
 ```bash
 git clone https://github.com/j4m3z0r/proxxxy.git
 cd proxxxy
-
-go build -o proxxxy-server ./cmd/server/
-go build -o proxxxy-client ./cmd/client/
+make
 ```
 
-To also build the test client (a minimal X11 window that toggles a rectangle):
-```bash
-go build -o testclient ./cmd/testclient/
-```
+This builds `proxxxy-server`, `proxxxy-client`, `proxxxy-testclient`, `proxxxy-ctl`, and `proxxxy-xlog` in the current directory.
+
+Individual targets: `make build` (default), `make test`, `make install` (installs to `$GOBIN`), `make clean`.
 
 ### Run tests
 
 ```bash
-go test ./...
+make test
 ```
 
 The server package includes an E2E reconnect test that spins up Xvfb on `:97`. On Linux with `xvfb-run` installed:

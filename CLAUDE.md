@@ -136,9 +136,10 @@ Synthesis runs in `server/synthesis.go` → `runSynthesis()` → `synthesiseAppC
 6. Pixmaps (create only)
 7. SHM pixmaps (recreated as regular pixmaps with matching depth/size)
 8. Fonts (`OpenFont` replay)
-9. Cursors (`CreateCursor`/`CreateGlyphCursor`, skipping those whose source is gone)
+9. Core cursors (`CreateCursor`/`CreateGlyphCursor`, skipping those whose source pixmap/font is gone)
 10. GCs (`CreateGC` + `ChangeGC` replay, with sanitize passes for dead drawables/pixmaps/fonts)
 11. RENDER Pictures + GlyphSets
+11c. RENDER cursors (`RenderCreateCursor`): after Pictures since they reference a source Picture. If the source picture's backing drawable is gone (e.g. Firefox creates a pixmap-backed picture for a cursor then immediately frees both), falls back to a glyph cursor from the "cursor" font — the ID exists so live traffic doesn't get BadCursor, but the cursor shape won't match.
 12. Pixmap draw commands (filtered: skip commands referencing freed GCs)
 13. Map windows
 14. Send `MsgSessionLive` (with finalSeqNum per connID)
@@ -184,6 +185,14 @@ The bottom three-quarters of the ridMask range belong to normal application reso
 
 When `oldBase != newBase` (the new X connection got a different resource-id-base), all synthesised resource IDs must be remapped. `applyIDRemap` handles: CreateWindow, ChangeWindowAttributes (CWCursor), ConfigureWindow, CreatePixmap, CreateGC (including GC value-list bits 10/11/14/19), ChangeGC, CopyGC, OpenFont/CloseFont, CreateCursor/CreateGlyphCursor, FreeCursor, CopyArea, CopyPlane, all RENDER opcodes, and MIT-SHM opcodes (ShmPutImage shmseg at offset 32, ShmCreatePixmap shmseg at offset 20).
 
+## applyEventReverseRemap (client-side synthesis)
+
+`applyIDRemap` remaps outgoing synthesis requests (app's old IDs → synthesis xconn's new IDs). But **incoming events** from the real display carry new-base IDs — the app, which is still using old-base IDs, won't recognise them and drops the events.
+
+`applyEventReverseRemap` is the inverse: called in `synthRelay` Phase 3 on every event (bytes[0] ≥ 2) when `oldBase != newBase`, it rewrites new-base IDs back to old-base. It handles all core X11 event types with window/drawable fields (KeyPress, ButtonPress, MotionNotify, Enter/LeaveNotify, Expose, CreateNotify, DestroyNotify, MapNotify, ReparentNotify, ConfigureNotify, ConfigureRequest, PropertyNotify, ColormapNotify, ClientMessage, etc.) and XI2 GenericEvents (type 35, evtype 2–10: event window at +24, child at +28).
+
+This was discovered when Chromium reconnects got a different ridBase — all keyboard events were silently dropped because Chromium's window IDs in the events didn't match the windows it had registered.
+
 ## Known Gap — Phase 3 Encoder Bypassed
 
 The encoder (`compress.Encoder`) is fully implemented and tested but **not wired into the relay path**. It was connected in commit `4313def`, but that broke the demo because the client only handles `MsgX11Data` — it has no decoder for `MsgDictDefine`, `MsgDictRef`, `MsgTemplateDefine`, or `MsgTemplateApply`.
@@ -202,6 +211,7 @@ The encoder (`compress.Encoder`) is fully implemented and tested but **not wired
 - **No tests** for `internal/client`.
 - **DrawCmds may reference freed GCs** — synthesis replays pixmap draw history which may include commands sent with GCs that were later freed. The synthesis now skips such commands (GC liveness filter in step 5), but pixmap content may be slightly incomplete until the Expose-triggered redraw.
 - **GDK freeze/thaw assertion** — after reconnect, GIMP may log `gdk_window_thaw_toplevel_updates: assertion 'window->update_and_descendants_freeze_count > 0' failed`. This is a non-fatal `g_return_if_fail` warning (the function returns without taking action). It occurs when the WM's `_NET_WM_SYNC_REQUEST` protocol and our ConfigureNotify injection interact during the reconnect window. Drawings still happen; the warning is cosmetic.
+- **XKB BadAccess (major=135)** — apps that use XKEYBOARD may generate `code=10 major=135` errors during synthesis. This is expected: XKB requires a per-connection `XkbUseExtension` handshake before any other XKB request; the synthesis xconn doesn't perform this handshake. The errors are non-fatal — apps fall back to core X11 keyboard handling. The E2E test harness filters `major=135` from the error check. Attempting to call `XkbUseExtension` on the synthesis xconn causes Xvfb to send `XkbNewKeyboardNotify` events that are then forwarded to the app, breaking keyboard routing — so don't try to fix this by enabling XKB on the synthesis xconn.
 
 ## Test Suite
 
@@ -212,6 +222,25 @@ go test ./...
 # ok  james.id.au/proxxxy/internal/wire
 # ok  james.id.au/proxxxy/internal/x11
 ```
+
+### E2E reconnect harness (`tests/run_stage.sh`)
+
+Shell harness that drives full reconnect lifecycles on Xvfb. Each stage runs a real app through N reconnect cycles and verifies no X errors appear.
+
+```bash
+tests/run_stage.sh --stage 9 --reconnects 3
+# Results in tests/results/YYYYMMDD-HHMMSS-stage9/
+```
+
+| Stage | App | What it tests | POST_RECONNECT_SETTLE |
+|---|---|---|---|
+| 1 | testclient | Baseline: minimal window, pixmap redraws | 2s |
+| 2–6 | GIMP | Full synthesis path: SHM, RENDER, depth-32 ARGB, complex hierarchies | varies |
+| 7 | Firefox | Browser rendering, URL navigation (xdotool type in address bar) | 20s |
+| 8 | Chromium | Browser rendering + ridBase-change event remap, URL navigation | 10s |
+| 9 | LibreOffice | Format menu open/close via xdotool | 3s |
+
+The `POST_RECONNECT_SETTLE` delay is how long the harness waits after synthesis before attempting post-reconnect input (menus, URL bar). Firefox/Chromium GPU compositors restart their renderer processes on reconnect and need extra time.
 
 ## Design Docs
 

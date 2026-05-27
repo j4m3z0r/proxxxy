@@ -3,6 +3,15 @@
 /proxxxy-client
 /proxxxy-ctl
 /testclient
+/server
+/ctl
 
 # build output
 *.test
+
+# test run results
+tests/results/
+
+# editor / tool state
+.claude/settings.local.json
+.claude/worktrees/

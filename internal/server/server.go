@@ -22,6 +22,7 @@ type Server struct {
 	displayNum int
 	tcpPort    int
 	statsPort  int
+	listenAddr string // host portion for TCP bind (default "127.0.0.1")
 
 	unixL     net.Listener
 	tcpL      net.Listener
@@ -37,11 +38,15 @@ type Server struct {
 	encoders       sync.Map // uint32 connID → *compress.Encoder
 }
 
-func New(displayNum, tcpPort, statsPort int) *Server {
+func New(displayNum, tcpPort, statsPort int, listenAddr string) *Server {
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1"
+	}
 	return &Server{
 		displayNum: displayNum,
 		tcpPort:    tcpPort,
 		statsPort:  statsPort,
+		listenAddr: listenAddr,
 		appConns:   make(map[uint32]net.Conn),
 		appState:   make(map[uint32]*x11.AppConn),
 	}
@@ -68,7 +73,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
-	tcpL, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.tcpPort))
+	tcpL, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.listenAddr, s.tcpPort))
 	if err != nil {
 		unixL.Close()
 		return fmt.Errorf("listen tcp: %w", err)

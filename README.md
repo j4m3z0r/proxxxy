@@ -122,6 +122,7 @@ See [`CLAUDE.md`](CLAUDE.md) for a detailed architecture reference including the
 |---|---|---|
 | `-display N` | `2` | Fake X display number to create (`:N`) |
 | `-port P` | `7100` | TCP port to listen on for clients |
+| `-listen addr` | `127.0.0.1` | Address to bind the TCP listener (`0.0.0.0` for all interfaces) |
 
 **proxxxy-client**
 

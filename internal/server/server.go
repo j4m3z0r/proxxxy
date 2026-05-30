@@ -190,10 +190,20 @@ func (s *Server) relayAppToClient(connID uint32, app net.Conn) {
 						continue
 					}
 					opcode := m.Payload[4] // [conn_id:4][opcode:1][...]
-					if x11.OpcodeNeedsReply(opcode) {
+					minor := byte(0)
+					if len(m.Payload) >= 6 {
+						minor = m.Payload[5]
+					}
+					// Core requests use OpcodeNeedsReply; extension requests
+					// (>=128, e.g. XKB XkbGetMap) use the per-extension table keyed
+					// on the major opcode learned from QueryExtension. Without this,
+					// a synchronous extension request issued during the disconnect
+					// window gets no reply and Xlib's _XReply blocks the whole app —
+					// leaving its window black after reconnect.
+					if x11.OpcodeNeedsReply(opcode) || (opcode >= 128 && ac.ExtNeedsReply(opcode, minor)) {
 						seq := uint16(ac.SeqNum())
-						log.Printf("server: conn %d: no client, fake reply opcode=%d seq=%d",
-							ac.ID, opcode, seq)
+						log.Printf("server: conn %d: no client, fake reply opcode=%d minor=%d seq=%d",
+							ac.ID, opcode, minor, seq)
 						sendFakeX11Reply(app, seq, ac.Order)
 					}
 					// MIT-SHM ShmPutImage with send_event=True: send a fake
@@ -392,6 +402,13 @@ func (s *Server) readFromClient(conn net.Conn) {
 			}
 		}
 		if app != nil {
+			// Learn extension major opcodes from QueryExtension replies so the
+			// disconnect-window fake-reply path knows which extension a dropped
+			// request belongs to. A QueryExtension reply is [1][pad][seq:2]
+			// [len:4=0][present:1][major:1][firstEvent:1][firstError:1][pad...].
+			if len(data) >= 12 && data[0] == 1 {
+				ac.LearnQueryExtensionReply(ac.Order.Uint16(data[2:4]), data[8] != 0, data[9])
+			}
 			if _, werr := app.Write(data); werr != nil {
 				log.Println("server: write to app:", werr)
 			}

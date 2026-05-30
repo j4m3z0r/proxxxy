@@ -638,6 +638,36 @@ func enableBigRequests(xconn net.Conn, order binary.ByteOrder) error {
 
 // readAndConsumeSetupReply reads and discards one X11 server setup reply from
 // conn, returning the new resource-id-base, resource-id-mask, and root window.
+// readSetupReply reads a complete X11 connection setup reply from conn and
+// returns the raw bytes. Used for pending connections (ridBase==0) where the
+// reply must be forwarded to the waiting app, not consumed.
+func readSetupReply(conn net.Conn, byteOrderByte byte) ([]byte, error) {
+	var order binary.ByteOrder = binary.LittleEndian
+	if byteOrderByte == 0x42 {
+		order = binary.BigEndian
+	}
+	hdr := make([]byte, 8)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return nil, fmt.Errorf("read setup reply header: %w", err)
+	}
+	var bodyLen int
+	if hdr[0] == 1 { // success: length at bytes[6:8] in 4-byte words
+		bodyLen = int(order.Uint16(hdr[6:8])) * 4
+	} else { // failed (0) or authenticate (2): reason string length in hdr[1]
+		bodyLen = int(hdr[1])
+	}
+	body := make([]byte, bodyLen)
+	if bodyLen > 0 {
+		if _, err := io.ReadFull(conn, body); err != nil {
+			return nil, fmt.Errorf("read setup reply body: %w", err)
+		}
+	}
+	result := make([]byte, 8+bodyLen)
+	copy(result, hdr)
+	copy(result[8:], body)
+	return result, nil
+}
+
 func readAndConsumeSetupReply(conn net.Conn, byteOrderByte byte) (ridBase, ridMask, rootWin uint32, err error) {
 	hdr := make([]byte, 8)
 	if _, err = io.ReadFull(conn, hdr); err != nil {
@@ -717,6 +747,47 @@ func (c *Client) handleX11Data(payload []byte) {
 			}
 		}
 		c.mu.Unlock()
+
+		// The first data for a new connection is always the X11 connection setup
+		// request (byte-order indicator 0x6C or 0x42). We must write it, read the
+		// setup reply, and forward the reply to the server (which delivers it to the
+		// waiting app) before starting relayXToServer. Without this, relayXToServer
+		// would read the setup reply and misinterpret its length field (a CARD16 at
+		// bytes[6:8], not the CARD32 at bytes[4:8] that regular replies use), trying
+		// to read hundreds of megabytes and hanging forever.
+		if len(data) > 0 && (data[0] == 0x6C || data[0] == 0x42) {
+			if _, writeErr := xconn.Write(data); writeErr != nil {
+				log.Println("client: write setup to display:", writeErr)
+				c.mu.Lock()
+				delete(c.xConns, connID)
+				c.mu.Unlock()
+				xconn.Close()
+				return
+			}
+			reply, replyErr := readSetupReply(xconn, data[0])
+			if replyErr != nil {
+				log.Println("client: read setup reply:", replyErr)
+				c.mu.Lock()
+				delete(c.xConns, connID)
+				c.mu.Unlock()
+				xconn.Close()
+				return
+			}
+			c.srvW.Lock()
+			fwdErr := wire.WriteX11Data(c.server, connID, reply)
+			c.srvW.Unlock()
+			if fwdErr != nil {
+				log.Println("client: forward setup reply to server:", fwdErr)
+				c.mu.Lock()
+				delete(c.xConns, connID)
+				c.mu.Unlock()
+				xconn.Close()
+				return
+			}
+			go c.relayXToServer(connID, xconn)
+			return
+		}
+
 		go c.relayXToServer(connID, xconn)
 		hasRemap = false
 		isNewConn = true
@@ -767,10 +838,20 @@ func (c *Client) handleX11Data(payload []byte) {
 	}
 }
 
-// isGPUExtension reports whether the named X11 extension uses FD passing (DRI3
-// dma-buf), which proxxxy cannot forward over its TCP wire protocol. Suppressing
-// these extensions forces apps to fall back to software GL (Mesa llvmpipe,
-// SwiftShader) that renders through MIT-SHM/XPutImage paths proxxxy handles.
+// isGPUExtension reports whether the named X11 extension cannot be forwarded over
+// proxxxy's TCP wire protocol and must be suppressed (QueryExtension rewritten to
+// "not present") so apps fall back to wire-friendly paths.
+//
+//   - DRI2/DRI3/Present pass GPU dma-buf file descriptors via SCM_RIGHTS ancillary
+//     data, which cannot cross a TCP relay → apps fall back to software GL.
+//
+// NOTE: MIT-SHM is intentionally NOT suppressed. Suppressing it globally
+// regresses the local case (app, server and X server on one host, e.g. the Xvfb
+// E2E tests), where GIMP relies on shared-memory rendering and does not fall back
+// to XPutImage cleanly. On a remote link ShmAttach simply fails (the segment is
+// on another host) and apps fall back to RENDER/XPutImage on their own, so no
+// suppression is needed — what mattered was tracking SYNC/MIT-SHM/XInput by their
+// real (server-assigned) opcodes; see internal/x11 extByOpcode.
 func isGPUExtension(name string) bool {
 	switch name {
 	case "DRI2", "DRI3", "Present":
@@ -1195,9 +1276,19 @@ func localDisplay() string {
 }
 
 // dialX11 opens a connection to the X display at the given display string.
-// Supports :N and :N.S (Unix socket). TCP displays (host:N) are not yet supported.
+// Supports:
+//   - :N and :N.S  — standard Unix socket at /tmp/.X11-unix/XN
+//   - /path/to/socket:N — XQuartz/macOS format; the socket file is the path before the last colon
 func dialX11(display string) (net.Conn, error) {
-	if len(display) == 0 || display[0] != ':' {
+	if len(display) == 0 {
+		return nil, fmt.Errorf("unsupported display format: %q", display)
+	}
+	if display[0] == '/' {
+		// XQuartz on macOS sets DISPLAY to the Unix socket path directly,
+		// with the display number as part of the filename (e.g. "...xquartz:0").
+		return net.Dial("unix", display)
+	}
+	if display[0] != ':' {
 		return nil, fmt.Errorf("unsupported display format: %q", display)
 	}
 	num := display[1:]

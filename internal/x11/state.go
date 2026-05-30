@@ -119,6 +119,22 @@ type AppConn struct {
 	shmSegs     map[uint32][]byte // shmseg resource ID → raw ShmAttach request bytes
 	shmPixmaps  map[uint32][]byte // pixmap resource ID → raw ShmCreatePixmap request bytes
 	syncCounters map[uint32][]byte // counter resource ID → raw SyncCreateCounter request bytes
+	// dynamicRenderOpcode is the RENDER major opcode as assigned by the real X
+	// server. X.org assigns opcode 139 by convention, but XQuartz uses 141. We
+	// learn the actual value from the first RenderCreatePicture request the app
+	// sends (req[1] == RenderCreatePicture minor opcode == 4, len >= 20). Zero
+	// means not yet learned; fall back to OpcodeRender (139) in that case.
+	dynamicRenderOpcode byte
+
+	// Extension major opcodes are server-assigned and NOT fixed: X.org and XQuartz
+	// disagree (e.g. XKEYBOARD is 135 on X.org but 136 on XQuartz). We learn the
+	// real opcode for each extension by pairing QueryExtension requests with their
+	// replies. pendingQueryExt maps a QueryExtension request's sequence number to
+	// the extension name; extByOpcode maps the learned major opcode to the name.
+	// Used so the disconnect-window fake-reply logic knows which extension a
+	// dropped request belongs to (see ExtNeedsReply).
+	pendingQueryExt map[uint16]string
+	extByOpcode     map[byte]string
 }
 
 func NewAppConn(id uint32, order ByteOrder) *AppConn {
@@ -136,6 +152,8 @@ func NewAppConn(id uint32, order ByteOrder) *AppConn {
 		shmSegs:      make(map[uint32][]byte),
 		shmPixmaps:   make(map[uint32][]byte),
 		syncCounters: make(map[uint32][]byte),
+		pendingQueryExt: make(map[uint16]string),
+		extByOpcode:     make(map[byte]string),
 	}
 }
 
@@ -193,7 +211,54 @@ func (a *AppConn) ProcessRequest(req []byte) {
 		a.handleMITSHM(req)
 	case OpcodeSYNC:
 		a.handleSYNC(req)
+	case OpcodeQueryExtension:
+		// [98][pad][len:2][nameLen:2][pad:2][name...]. Record seq->name so the
+		// reply (parsed in the server relay) can teach us the extension's opcode.
+		if len(req) >= 8 {
+			nameLen := int(a.Order.Uint16(req[4:6]))
+			if len(req) >= 8+nameLen {
+				a.pendingQueryExt[uint16(a.seqNum)] = string(req[8 : 8+nameLen])
+			}
+		}
 	default:
+		// Extension major opcodes are NOT fixed: XQuartz assigns SYNC=135,
+		// MIT-SHM=132, XInput=133 (vs X.org's 134/130/131). Route by the opcode
+		// learned from QueryExtension (extByOpcode) so extension state is tracked
+		// on every server. This is critical for SYNC: GTK's frame clock issues
+		// SyncSetCounter on a counter it created; if proxxxy doesn't track the
+		// SyncCreateCounter (wrong opcode), synthesis can't recreate the counter,
+		// and after reconnect SyncSetCounter hits a dead counter → BadCounter →
+		// the app crashes.
+		switch a.extByOpcode[opcode] {
+		case "SYNC":
+			a.handleSYNC(req)
+			return
+		case "MIT-SHM":
+			a.handleMITSHM(req)
+			return
+		case "XInputExtension":
+			a.handleXInput(req)
+			return
+		}
+		// Dynamically detect the RENDER extension: when the first
+		// RenderCreatePicture (minor=4, len>=20) arrives with any extension
+		// opcode, record it as the RENDER opcode and route all subsequent requests
+		// with that opcode to handleRender. (RENDER is also covered by extByOpcode
+		// once QueryExtension is seen, but this catches it even earlier.)
+		if opcode >= 128 && len(req) >= 4 {
+			minor := req[1]
+			if a.dynamicRenderOpcode == 0 && minor == RenderCreatePicture && len(req) >= 20 {
+				reqLen := a.Order.Uint16(req[2:4])
+				if reqLen >= 5 {
+					a.dynamicRenderOpcode = opcode
+					log.Printf("x11: conn %d learned dynamic RENDER opcode=%d", a.ID, opcode)
+				}
+			}
+			if a.dynamicRenderOpcode != 0 && opcode == a.dynamicRenderOpcode {
+				a.handleRender(req)
+				return
+			}
+		}
 		a.maybeTrackDrawCmd(opcode, req)
 	}
 }
@@ -455,7 +520,8 @@ func (a *AppConn) handleFreeGC(req []byte) {
 	if len(req) < 8 {
 		return
 	}
-	delete(a.gcs, U32(req, 4, a.Order))
+	id := U32(req, 4, a.Order)
+	delete(a.gcs, id)
 }
 
 func (a *AppConn) handleCreatePixmap(req []byte) {
@@ -940,6 +1006,60 @@ func removeID(s []uint32, id uint32) []uint32 {
 		}
 	}
 	return out
+}
+
+// LearnQueryExtensionReply matches a QueryExtension reply (by sequence number)
+// to the pending request and records the extension's server-assigned major
+// opcode. Called by the server when relaying replies from the real X server.
+func (a *AppConn) LearnQueryExtensionReply(seq uint16, present bool, major byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	name, ok := a.pendingQueryExt[seq]
+	if !ok {
+		return
+	}
+	delete(a.pendingQueryExt, seq)
+	if present && major != 0 {
+		a.extByOpcode[major] = name
+	}
+}
+
+// xkbReplyMinors is the set of XKEYBOARD minor opcodes that elicit a reply.
+// GTK apps (GIMP, Firefox, LibreOffice) issue XkbGetMap (8), XkbGetNames (17),
+// etc. synchronously; if one lands in a client-disconnect window with no reply,
+// Xlib's _XReply blocks and the whole app freezes (window stays black after
+// reconnect). Source: xkbproto request list.
+var xkbReplyMinors = map[byte]bool{
+	0: true, 4: true, 6: true, 8: true, 10: true, 14: true,
+	16: true, 17: true, 19: true, 21: true, 24: true,
+}
+
+// extReplyMinors maps an extension name to the set of its minor opcodes that
+// elicit a reply (only the ones GTK toolkits issue synchronously are needed).
+var extReplyMinors = map[string]map[byte]bool{
+	"XKEYBOARD": xkbReplyMinors,
+	"RENDER":    {0: true, 1: true, 2: true, 29: true}, // QueryVersion/PictFormats/PictIndexValues/QueryFilters
+	"SYNC":      {0: true, 1: true, 5: true},           // Initialize/ListSystemCounters/QueryCounter
+	"XFIXES":    {0: true},                             // QueryVersion
+	"DAMAGE":    {0: true},                             // QueryVersion
+	"RANDR":     {0: true},                             // QueryVersion
+	"MIT-SHM":   {0: true},                             // QueryVersion
+	"XInputExtension": {1: true, 47: true},             // GetExtensionVersion/XIQueryVersion
+}
+
+// ExtNeedsReply reports whether an extension request (major opcode + minor)
+// expects a synchronous reply, using the opcodes learned via QueryExtension.
+// Used by the disconnect-window fake-reply path to avoid hanging apps that
+// issue synchronous extension requests (notably XKB) while no client is
+// connected. Returns false for unknown extensions/minors (safer not to fake).
+func (a *AppConn) ExtNeedsReply(opcode, minor byte) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	name, ok := a.extByOpcode[opcode]
+	if !ok {
+		return false
+	}
+	return extReplyMinors[name][minor]
 }
 
 // OpcodeNeedsReply reports whether the X11 core-protocol opcode expects a

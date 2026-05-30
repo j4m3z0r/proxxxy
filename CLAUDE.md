@@ -165,6 +165,24 @@ GTK3 calls `XSelectInput` (= `ChangeWindowAttributes` with `CWEventMask`) AFTER 
 
 `DestroyWindow` in X11 destroys the entire subtree. Previously `handleDestroyWindow` only removed the specified window. Orphan children remained in `appState` with a stale parent. On the next synthesis, `findRoots` treated orphans as roots and tried to create them with their (now non-existent) parent → `BadWindow`. `destroyWindowTree` now recursively removes all descendants.
 
+## Remote X server (XQuartz) compatibility
+
+proxxxy is normally used as a *remote* proxy (app + server on one host, proxxxy-client + real X server on another, e.g. a Mac running XQuartz). Two XQuartz facts broke synthesis until fixed:
+
+### Dynamic extension major opcodes
+
+Extension major opcodes are **server-assigned, not fixed**. X.org and XQuartz disagree: RENDER 139→**141**, MIT-SHM 130→**132**, SYNC 134→**135**, XInput 131→**133**. The hardcoded `Opcode*` constants in `internal/x11/opcodes.go` are only correct for X.org/Xvfb. `AppConn` now **learns** each extension's real opcode by pairing `QueryExtension` requests (recorded in `ProcessRequest` → `pendingQueryExt[seq]=name`) with their replies (parsed in `server.go readFromClient` → `LearnQueryExtensionReply`, populating `extByOpcode`). `ProcessRequest`'s default case dispatches SYNC/MIT-SHM/XInput by learned opcode. (RENDER also has an independent `dynamicRenderOpcode` learned from the first `RenderCreatePicture`.)
+
+**Why this matters most for SYNC:** GTK's frame clock creates an XSync counter and issues `SyncSetCounter` (SYNC minor 3) on it every frame. With the hardcoded SYNC opcode (134) wrong on XQuartz (135), `handleSYNC` never fired → the counter was never tracked → synthesis never recreated it → after reconnect `SyncSetCounter` referenced a dead counter → `BadCounter` (code=138) → **GIMP/Firefox crashed** (window vanished). With the learned opcode, the counter is tracked and replayed (`SyncCounters()` → synthesis step 4), so it survives reconnect.
+
+### Extension reply-faking during the disconnect window
+
+While no client is connected (or during synthesis), app requests are dropped and `OpcodeNeedsReply` injects a fake reply for **core** reply-expecting requests so XLib's `_XReply` doesn't block. Extension requests were not covered, so a synchronous extension request in that window (notably XKB `XkbGetMap`, opcode 135/136) hung the whole app → black window after reconnect. `AppConn.ExtNeedsReply(opcode, minor)` now uses the learned opcode + per-extension reply-minor tables (`extReplyMinors`, covering XKB/RENDER/SYNC/XFIXES/DAMAGE/RANDR/MIT-SHM/XInput); `drainRequests` fakes replies for those too.
+
+### Capture caveat for testing on XQuartz
+
+`xwd -id` returns an all-black image for a composited window once it has **settled** (no backing store), but captures correctly in the brief window right after the app redraws (post-Expose). Test tooling must capture rapidly right after a reconnect and keep the brightest frame — a settled read falsely looks black. (`xwd -root` and `screencapture` of X coordinates are both useless under rootless XQuartz.)
+
 ## injectColormap (client-side synthesis)
 
 During synthesis (`inSynthesis=true`), depth-32 `CreateWindow` requests that lack `CWColormap` get a scratch colormap injected by `injectColormap`. The original colormap ID refers to a dead connection; without an explicit colormap the real X server returns `BadMatch`. Scratch colormaps are allocated from the top of the synthesis xconn's resource range (counting down from `ridBase | ridMask`) and cached by visual ID in `synthXconnState`.

@@ -26,6 +26,7 @@ cmd/server/       proxxxy-server binary (flags: -display N, -port P)
 cmd/client/       proxxxy-client binary (flags: -server host:port)
 cmd/testclient/   minimal X11 app: 300×300 window, 200×200 rect toggling white/black every 1s
 cmd/ctl/          thin stats CLI stub (dials localhost:7101; server stats endpoint not implemented)
+cmd/inputtest/    test helper: injects keystrokes/clicks into an X11 window via XSendEvent (XQuartz has no XTEST). Flags: -win, -text/-enter, -click X,Y, -dumpext, -resize
 internal/wire/    wire framing: 5-byte header [type:1][length:4 LE], 64 MB max
 internal/server/  Server struct, session parsing, Phase 2 synthesis
 internal/client/  Client struct, local display relay
@@ -167,7 +168,17 @@ GTK3 calls `XSelectInput` (= `ChangeWindowAttributes` with `CWEventMask`) AFTER 
 
 ## Remote X server (XQuartz) compatibility
 
-proxxxy is normally used as a *remote* proxy (app + server on one host, proxxxy-client + real X server on another, e.g. a Mac running XQuartz). Two XQuartz facts broke synthesis until fixed:
+proxxxy is normally used as a *remote* proxy: app + proxxxy-server on one host, proxxxy-client + the real X server on another (e.g. a Mac running XQuartz over TCP). The Xvfb E2E tests run everything on one host with **no window manager**, so they miss the XQuartz realities below. (XQuartz also runs **quartz-wm**, which reparents and decorates top-level windows — unlike the test Xvfb.)
+
+### Connecting to XQuartz (`dialX11`, client)
+
+XQuartz sets `DISPLAY` to a **Unix socket path**, not `:N` — e.g. `/var/run/com.apple.launchd.XXXX/org.macosforge.xquartz:0` (the `:0` is part of the filename). `dialX11` dials that path directly when `DISPLAY` starts with `/`. The client also forwards the connection **setup reply** for app connections that arrived before any client (`readSetupReply` + the setup-handshake path in `handleX11Data`); without this the app blocks forever waiting for its setup reply.
+
+### Input injection for testing (XQuartz has no XTEST)
+
+`xdpyinfo` shows XQuartz does **not** advertise XTEST, so `xdotool`-style real input is unavailable. `cmd/inputtest` injects via core-X11 `XSendEvent` instead (keys and button clicks). Caveats: apps must run with `allowSendEvents:true` to honour synthetic events (xterm: `-xrm 'XTerm*allowSendEvents:true'`); and xgb's `KeyReleaseEvent.Bytes()`/`ButtonReleaseEvent.Bytes()` emit the *press* code, so the release byte[0] must be overridden to 3/5 or every event doubles. Send input to the app's content window (the WM_CLASS-bearing window), not the quartz-wm frame.
+
+Two XQuartz facts broke synthesis until fixed:
 
 ### Dynamic extension major opcodes
 
@@ -179,9 +190,16 @@ Extension major opcodes are **server-assigned, not fixed**. X.org and XQuartz di
 
 While no client is connected (or during synthesis), app requests are dropped and `OpcodeNeedsReply` injects a fake reply for **core** reply-expecting requests so XLib's `_XReply` doesn't block. Extension requests were not covered, so a synchronous extension request in that window (notably XKB `XkbGetMap`, opcode 135/136) hung the whole app → black window after reconnect. `AppConn.ExtNeedsReply(opcode, minor)` now uses the learned opcode + per-extension reply-minor tables (`extReplyMinors`, covering XKB/RENDER/SYNC/XFIXES/DAMAGE/RANDR/MIT-SHM/XInput); `drainRequests` fakes replies for those too.
 
-### Capture caveat for testing on XQuartz
+### ⚠️ KNOWN BUG (unfixed): content not flushed to the macOS screen
 
-`xwd -id` returns an all-black image for a composited window once it has **settled** (no backing store), but captures correctly in the brief window right after the app redraws (post-Expose). Test tooling must capture rapidly right after a reconnect and keep the brightest frame — a settled read falsely looks black. (`xwd -root` and `screencapture` of X coordinates are both useless under rootless XQuartz.)
+After synthesis (and on initial connect for GTK apps), the app draws into XQuartz's internal X framebuffer but XQuartz does **not** flush it to the on-screen macOS surface — the window shows **black on screen** (title bar + resize grip visible, content black) until some window event (a resize/restack) forces a redisplay, at which point the full UI appears. Native apps on XQuartz don't hit this, so it is proxxxy-specific (suspected: XQuartz's rootless redisplay/block-handler flush isn't triggered by proxxxy's relayed drawing). This is THE remaining blocker for GIMP/Firefox actually being usable on the Mac. Not yet fixed.
+
+### Verifying on XQuartz — `xwd` LIES; use screen-truth capture
+
+**Do not trust `xwd` for "did it render on the Mac screen".** `xwd -id` reads XQuartz's internal X framebuffer, which contains the app's drawing even when the macOS screen shows black (see the bug above) — so xwd reported full GIMP/Firefox UIs that were actually black on screen. The only reliable check is the **actual displayed surface**:
+
+- `tests/xqwin.swift` (`swiftc -O -o /tmp/xqwin tests/xqwin.swift`) uses `CGWindowListCopyWindowInfo` to list XQuartz windows with their CoreGraphics window IDs; then `screencapture -o -l<cgWindowID> out.png` captures what is really on screen, across macOS Spaces. (`xwd -root` and `screencapture` of X coordinates are both useless under rootless XQuartz — app windows live in their own Space/surfaces.)
+- A real-luminance metric is needed (not nonzero-byte ratio: depth-24-in-32 pixels keep a 0xFF pad byte, so a black window reads ~0.25).
 
 ## injectColormap (client-side synthesis)
 
